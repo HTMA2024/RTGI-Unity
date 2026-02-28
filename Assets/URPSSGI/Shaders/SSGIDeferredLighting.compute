@@ -1,0 +1,130 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "SSGICommon.hlsl"
+
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel SSGIDeferredLit
+
+#define DEFERRED_TILE_SIZE 8
+#define SSGI_CLAMP_VALUE 7.0
+
+Texture2D<float4> _SSGIGBuffer0;
+Texture2D<float4> _SSGIGBuffer1;
+Texture2D<float4> _SSGIGBuffer2;
+Texture2D<float4> _SSGIHitPositionNDC;
+
+RWTexture2D<float3> _IndirectDiffuseTextureRW;
+
+Texture2D<float4> _GBuffer0;
+Texture2D<float3> _PrevIndirectDiffuseTexture;
+int _SSGIMultiBounce;
+
+float SampleMainLightShadow(float3 positionWS, float3 normalWS, float NdotL)
+{
+
+    float3 biasedPositionWS = positionWS + normalWS * (0.03 * (1.0 - saturate(NdotL)));
+
+    int cascadeIdx = ComputeCascadeIndex(biasedPositionWS);
+    float4 sc = mul(_MainLightWorldToShadow[cascadeIdx], float4(biasedPositionWS, 1.0));
+
+    float inRange = step(0.001, sc.z) * step(sc.z, 0.999);
+
+    int2 texelCoord = int2(sc.xy * _MainLightShadowmapSize.zw);
+    float d = _MainLightShadowmapTexture.Load(int3(texelCoord, 0));
+
+    float shadow = lerp(1.0, step(d, sc.z), inRange);
+
+    return lerp(1.0, shadow, _MainLightShadowParams.x);
+}
+
+[numthreads(DEFERRED_TILE_SIZE, DEFERRED_TILE_SIZE, 1)]
+void SSGIDeferredLit(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 currentCoord = dispatchThreadId.xy;
+
+    float4 hitInfo = _SSGIHitPositionNDC[currentCoord];
+
+    if (hitInfo.w < 0.5)
+        return;
+
+    float3 albedo   = _SSGIGBuffer0[currentCoord].rgb;
+    float3 normalWS = _SSGIGBuffer2[currentCoord].xyz;
+
+    float2 hitNDC = hitInfo.xy;
+#if UNITY_UV_STARTS_AT_TOP
+    hitNDC.y = 1.0 - hitNDC.y;
+#endif
+    float4 hitCS = float4(hitNDC * 2.0 - 1.0, hitInfo.z, 1.0);
+    float4 hitWS4 = mul(UNITY_MATRIX_I_VP, hitCS);
+    float3 hitPositionWS = hitWS4.xyz * rcp(hitWS4.w);
+
+    float NdotL_main = saturate(dot(normalWS, _MainLightPosition.xyz));
+    float shadow = SampleMainLightShadow(hitPositionWS, normalWS, NdotL_main);
+    float3 lighting = _MainLightColor.rgb * (NdotL_main * shadow);
+
+    int additionalLightsCount = (int)_AdditionalLightsCount.x;
+    for (int i = 0; i < additionalLightsCount; i++)
+    {
+        float4 lightPos  = _AdditionalLightsPosition[i];
+        float4 lightCol  = _AdditionalLightsColor[i];
+        float4 lightAtt  = _AdditionalLightsAttenuation[i];
+        float4 spotDir   = _AdditionalLightsSpotDir[i];
+
+        float3 lightVec = lightPos.xyz - hitPositionWS * lightPos.w;
+        float distSqr = dot(lightVec, lightVec);
+
+        float rcpDistSqr = rcp(max(distSqr, 6.103515625e-5));
+        float3 lightDir = lightVec * rsqrt(max(distSqr, 6.103515625e-5));
+
+        float distAtten = distSqr * lightAtt.x;
+        distAtten = distAtten * distAtten;
+        distAtten = saturate(1.0 - distAtten);
+        distAtten = distAtten * distAtten * rcpDistSqr;
+
+        float spotAtten = saturate(dot(lightDir, spotDir.xyz) * lightAtt.z + lightAtt.w);
+        spotAtten = spotAtten * spotAtten;
+
+        float atten = distAtten * spotAtten;
+
+        float NdotL = saturate(dot(normalWS, lightDir));
+
+        lighting += lightCol.rgb * (NdotL * atten);
+    }
+
+    float3 color = albedo * lighting;
+
+    if (_SSGIMultiBounce)
+    {
+        uint2 hitPixelCoord = (uint2)(hitInfo.xy * _SSGIScreenSize.xy);
+        float3 hitAlbedo = _GBuffer0[hitPixelCoord].rgb;
+        float3 prevGI = SAMPLE_TEXTURE2D_LOD(_PrevIndirectDiffuseTexture, sampler_LinearClamp,
+            hitInfo.xy, 0).rgb;
+        color += hitAlbedo * prevGI;
+    }
+
+    color = IsNaN(color.x) ? 0.0 : color;
+    color = RgbToHsv(color);
+    color.z = min(color.z, SSGI_CLAMP_VALUE);
+    color = HsvToRgb(color);
+
+    _IndirectDiffuseTextureRW[currentCoord] = color;
+}
+
+#pragma kernel MergeSSGIAndRTGI
+
+Texture2D<float3> _SSGILitResult;
+Texture2D<float3> _RTGILitResult;
+Texture2D<float>  _MergeMask;
+RWTexture2D<float3> _MergedGIOutputRW;
+
+[numthreads(DEFERRED_TILE_SIZE, DEFERRED_TILE_SIZE, 1)]
+void MergeSSGIAndRTGI(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    float3 ssgiColor = _SSGILitResult[coord];
+    float3 rtgiColor = _RTGILitResult[coord];
+    float mask = _MergeMask[coord];
+
+    _MergedGIOutputRW[coord] = lerp(rtgiColor, ssgiColor, mask);
+}

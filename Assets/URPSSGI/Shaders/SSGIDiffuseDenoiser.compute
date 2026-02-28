@@ -1,0 +1,258 @@
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel GeneratePointDistribution
+#pragma kernel BilateralFilterColor
+#pragma kernel BilateralFilterAO
+
+#pragma multi_compile _ _SSGI_ACCURATE_NORMALS
+
+#include "SSGICommon.hlsl"
+
+#define DIFFUSE_DENOISER_TILE_SIZE 8
+#define PIXEL_RADIUS_TOLERANCE_THRESHOLD 2
+
+float _DenoiserFilterRadius;
+float _PixelSpreadAngleTangent;
+int   _JitterFramePeriod;
+float4 _FullScreenSize;
+
+RWStructuredBuffer<float2> _PointDistributionRW;
+StructuredBuffer<float2>   _PointDistribution;
+
+Texture2D<float3> _DenoiseInputTexture;
+Texture2D<float>  _DepthPyramidTexture;
+
+RWTexture2D<float3> _DenoiseOutputTextureRW;
+
+float GetLDSequenceSampleFloat(uint idx, uint dim)
+{
+    return LOAD_TEXTURE2D(_OwenScrambledTexture, uint2(dim, idx & 255u)).r;
+}
+
+[numthreads(64, 1, 1)]
+void GeneratePointDistribution(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    _PointDistributionRW[dispatchThreadId.x] = SampleDiskCubic(
+        GetLDSequenceSampleFloat(dispatchThreadId.x, 0),
+        GetLDSequenceSampleFloat(dispatchThreadId.x, 1));
+}
+
+float gaussian(float radius, float sigma)
+{
+    float t = radius * rcp(sigma);
+    return exp(-t * t);
+}
+
+float3 ReconstructWorldPosition(uint2 fullResCoord, float depth)
+{
+    float2 uv = (fullResCoord + 0.5) * _FullScreenSize.zw;
+    float2 posCS = uv * 2.0 - 1.0;
+#if UNITY_UV_STARTS_AT_TOP
+    posCS.y = -posCS.y;
+#endif
+    float4 hpositionWS = mul(unity_MatrixInvVP, float4(posCS, depth, 1.0));
+    return hpositionWS.xyz * rcp(hpositionWS.w);
+}
+
+float ComputeMaxDenoisingRadius(float3 positionRWS)
+{
+    float distanceToPoint = length(positionRWS);
+
+    return distanceToPoint * _DenoiserFilterRadius * rcp(lerp(5.0, 50.0, saturate(distanceToPoint * 0.002)));
+}
+
+float ComputeMaxReprojectionWorldRadius(float3 posWS, float3 normalWS,
+    float maxDistance, float pixelTolerance)
+{
+
+    float3 viewWS = normalize(-posWS);
+    float parallelPixelFootPrint = _PixelSpreadAngleTangent * length(posWS);
+    float cosAngle = abs(dot(normalWS, viewWS));
+    float realPixelFootPrint = parallelPixelFootPrint * rcp(cosAngle + 0.000001);
+    return max(maxDistance, realPixelFootPrint * pixelTolerance);
+}
+
+#define DEPTH_WEIGHT 1.0
+
+float ComputeBilateralWeight(
+    float3 centerPos, float centerZ01, half3 centerNormal,
+    float3 tapPos,    float tapZ01,    half3 tapNormal,
+    float tapLuminance)
+{
+
+    float depthWeight = max(0.0, 1.0 - abs(tapZ01 - centerZ01) * DEPTH_WEIGHT);
+
+    half nd = saturate(dot(tapNormal, centerNormal));
+    half nd2 = nd * nd;
+    half normalWeight = nd2 * nd2;
+
+    float3 dq = centerPos - tapPos;
+    float distance2 = dot(dq, dq);
+    float planeError = max(abs(dot(dq, (float3)tapNormal)), abs(dot(dq, (float3)centerNormal)));
+    float planeW = (distance2 < 0.0001) ? 1.0 :
+        saturate(1.0 - 2.0 * planeError * rsqrt(distance2));
+    float planeWeight = planeW * planeW;
+
+    float luminanceWeight = rcp(1.0 + tapLuminance);
+
+    return depthWeight * (float)normalWeight * planeWeight * luminanceWeight;
+}
+
+[numthreads(DIFFUSE_DENOISER_TILE_SIZE, DIFFUSE_DENOISER_TILE_SIZE, 1)]
+void BilateralFilterColor(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 currentCoord = dispatchThreadId.xy;
+
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)currentCoord * resScale);
+
+    float centerDepth = LOAD_TEXTURE2D(_DepthPyramidTexture, fullResCoord).r;
+
+    if (centerDepth == UNITY_RAW_FAR_CLIP_VALUE)
+    {
+        _DenoiseOutputTextureRW[currentCoord] = float3(0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 centerPos = ReconstructWorldPosition(fullResCoord, centerDepth);
+    half3 centerNormal = (half3)DecodeNormalURP(fullResCoord);
+    float centerZ01 = Linear01Depth(centerDepth, _ZBufferParams);
+
+    float3x3 localToWorld = GetLocalFrame((float3)centerNormal);
+    float denoisingRadius = ComputeMaxReprojectionWorldRadius(centerPos, (float3)centerNormal,
+        ComputeMaxDenoisingRadius(centerPos), PIXEL_RADIUS_TOLERANCE_THRESHOLD);
+    float sigma = 0.9 * denoisingRadius;
+
+    int sampleOffset = (_JitterFramePeriod != -1) ? _JitterFramePeriod * 16 : 0;
+
+    float4 centerClip    = mul(unity_MatrixVP, float4(centerPos, 1.0));
+    float4 tangentClip   = mul(unity_MatrixVP, float4(localToWorld[0], 0.0));
+    float4 bitangentClip = mul(unity_MatrixVP, float4(localToWorld[1], 0.0));
+
+    float3 colorSum = 0.0;
+    float wSum = 0.0;
+
+    [unroll]
+    for (uint sampleIndex = 0; sampleIndex < 16u; ++sampleIndex)
+    {
+
+        float2 newSample = _PointDistribution[sampleIndex + sampleOffset] * denoisingRadius;
+
+        float4 hClip = centerClip + tangentClip * newSample.x + bitangentClip * newSample.y;
+        hClip.xyz *= rcp(hClip.w);
+
+        if (hClip.x > 1.0 || hClip.x < -1.0 || hClip.y > 1.0 || hClip.y < -1.0)
+            continue;
+
+        float2 nDC = hClip.xy * 0.5 + 0.5;
+    #if UNITY_UV_STARTS_AT_TOP
+        nDC.y = 1.0 - nDC.y;
+    #endif
+
+        uint2 tapFullResCoord = (uint2)(nDC * _FullScreenSize.xy);
+
+        uint2 tapCoord = (uint2)(nDC * _SSGIScreenSize.xy);
+
+        float tapDepth = LOAD_TEXTURE2D(_DepthPyramidTexture, tapFullResCoord).r;
+
+        if (tapDepth == UNITY_RAW_FAR_CLIP_VALUE)
+            continue;
+
+        float tapZ01 = Linear01Depth(tapDepth, _ZBufferParams);
+
+        float tapEyeDepth = LinearEyeDepth(tapDepth, _ZBufferParams);
+        if (abs(tapEyeDepth - hClip.w) > 0.1)
+            continue;
+
+        float3 tapPos = ReconstructWorldPosition(tapFullResCoord, tapDepth);
+        half3 tapNormal = (half3)DecodeNormalURP(tapFullResCoord);
+
+        float3 tapColor = LOAD_TEXTURE2D(_DenoiseInputTexture, tapCoord).rgb;
+        float tapLuminance = dot(tapColor, float3(0.2126, 0.7152, 0.0722));
+
+        float r = length(newSample);
+
+        float w = (r > 0.001) ?
+            gaussian(r, sigma) * ComputeBilateralWeight(centerPos, centerZ01, centerNormal, tapPos, tapZ01, tapNormal, tapLuminance) :
+            1.0;
+
+        colorSum += tapColor * w;
+        wSum += w;
+    }
+
+    if (wSum == 0.0)
+    {
+        colorSum = LOAD_TEXTURE2D(_DenoiseInputTexture, currentCoord).rgb;
+        wSum = 1.0;
+    }
+
+    float3 result = colorSum * rcp(wSum);
+
+    result = IsNaN(result.x) ? 0.0 : result;
+    _DenoiseOutputTextureRW[currentCoord] = result;
+}
+
+Texture2D<float>   _AODenoiseInputTexture;
+RWTexture2D<float> _AODenoiseOutputTextureRW;
+
+[numthreads(DIFFUSE_DENOISER_TILE_SIZE, DIFFUSE_DENOISER_TILE_SIZE, 1)]
+void BilateralFilterAO(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 currentCoord = dispatchThreadId.xy;
+
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)currentCoord * resScale);
+
+    float centerDepth = LOAD_TEXTURE2D(_DepthPyramidTexture, fullResCoord).r;
+
+    if (centerDepth == UNITY_RAW_FAR_CLIP_VALUE)
+    {
+        _AODenoiseOutputTextureRW[currentCoord] = 0.0;
+        return;
+    }
+
+    float centerZ01 = Linear01Depth(centerDepth, _ZBufferParams);
+    half3 centerNormal = (half3)DecodeNormalURP(fullResCoord);
+    float centerAO = LOAD_TEXTURE2D(_AODenoiseInputTexture, currentCoord).r;
+
+    float aoSum = centerAO;
+    float wSum = 1.0;
+
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+
+            if (dx == 0 && dy == 0)
+                continue;
+
+            uint2 tapWorkCoord = currentCoord + uint2(dx, dy);
+            uint2 tapFullCoord = (uint2)((float2)tapWorkCoord * resScale);
+
+            float tapDepth = LOAD_TEXTURE2D(_DepthPyramidTexture, tapFullCoord).r;
+
+            if (tapDepth == UNITY_RAW_FAR_CLIP_VALUE)
+                continue;
+
+            float tapZ01 = Linear01Depth(tapDepth, _ZBufferParams);
+
+            float depthWeight = max(0.0, 1.0 - abs(tapZ01 - centerZ01) * DEPTH_WEIGHT);
+
+            half3 tapNormal = (half3)DecodeNormalURP(tapFullCoord);
+            half nd = saturate(dot(tapNormal, centerNormal));
+            half nd2 = nd * nd;
+            float w = depthWeight * (float)(nd2 * nd2);
+
+            aoSum += LOAD_TEXTURE2D(_AODenoiseInputTexture, tapWorkCoord).r * w;
+            wSum += w;
+        }
+    }
+
+    float result = aoSum * rcp(wSum);
+
+    result = IsNaN(result) ? 0.0 : result;
+
+    _AODenoiseOutputTextureRW[currentCoord] = result;
+}

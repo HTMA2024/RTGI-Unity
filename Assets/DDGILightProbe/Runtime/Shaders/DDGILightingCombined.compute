@@ -1,0 +1,248 @@
+#pragma kernel CSLightingCombined
+
+#include "UnityCG.cginc"
+#include "DDGISampling.hlsl"
+
+#define PI 3.14159265359
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+Texture2D<float4> _GBuffer_AlbedoRoughness;
+Texture2D<float4> _GBuffer_EmissionMetallic;
+
+RWTexture2D<float4> _RadianceBuffer;
+
+float4 _MainLightDirection;
+float4 _MainLightColor;
+
+#define MAX_ADDITIONAL_LIGHTS 8
+float4 _AdditionalLightPositions[MAX_ADDITIONAL_LIGHTS];
+float4 _AdditionalLightColors[MAX_ADDITIONAL_LIGHTS];
+float4 _AdditionalLightDirections[MAX_ADDITIONAL_LIGHTS];
+uint _AdditionalLightCount;
+
+Texture2D<float> _MainLightShadowMap;
+SamplerComparisonState sampler_MainLightShadowMap;
+
+float4x4 _MainLightWorldToShadow0;
+float4x4 _MainLightWorldToShadow1;
+float4x4 _MainLightWorldToShadow2;
+float4x4 _MainLightWorldToShadow3;
+
+float4 _CascadeShadowSplitSpheres0;
+float4 _CascadeShadowSplitSpheres1;
+float4 _CascadeShadowSplitSpheres2;
+float4 _CascadeShadowSplitSpheres3;
+float4 _CascadeShadowSplitSphereRadii;
+
+float4 _MainLightShadowParams;
+uint _UseShadows;
+uint _ShadowCascadeCount;
+
+Texture2D<float4> _IrradianceAtlas_Prev;
+Texture2D<float2> _DistanceAtlas_Prev;
+
+Texture2D<float4> _ProbeData;
+int _ProbeDataWidth;
+
+float4 _VolumeOrigin;
+float4 _VolumeSpacing;
+int4 _VolumeProbeCounts;
+
+float4 _IrradianceAtlasParams;
+float4 _DistanceAtlasParams;
+
+float _NormalBias;
+float _ViewBias;
+float _ChebyshevBias;
+float _IrradianceGamma;
+
+float _IndirectIntensity;
+float _MaxRayDistance;
+
+uint _GBufferWidth;
+uint _GBufferHeight;
+uint _RaysPerProbe;
+uint _ProbeCount;
+
+float PointLightAttenuation(float distanceSq, float rangeSq)
+{
+    float factor = distanceSq * rcp(rangeSq);
+    float smoothFactor = saturate(1.0 - factor * factor);
+    return smoothFactor * smoothFactor * rcp(max(distanceSq, 0.0001));
+}
+
+float SpotLightAttenuation(float3 lightDir, float3 spotDir, float spotAngle)
+{
+    float cosAngle = dot(-lightDir, spotDir);
+    float cosOuter = cos(spotAngle * 0.5);
+    float cosInner = cos(spotAngle * 0.25);
+    return saturate((cosAngle - cosOuter) * rcp(cosInner - cosOuter));
+}
+
+uint ComputeCascadeIndex(float3 positionWS)
+{
+    float3 fromCenter0 = positionWS - _CascadeShadowSplitSpheres0.xyz;
+    float3 fromCenter1 = positionWS - _CascadeShadowSplitSpheres1.xyz;
+    float3 fromCenter2 = positionWS - _CascadeShadowSplitSpheres2.xyz;
+    float3 fromCenter3 = positionWS - _CascadeShadowSplitSpheres3.xyz;
+
+    float4 distances2 = float4(
+        dot(fromCenter0, fromCenter0),
+        dot(fromCenter1, fromCenter1),
+        dot(fromCenter2, fromCenter2),
+        dot(fromCenter3, fromCenter3)
+    );
+
+    float4 weights = float4(distances2 < _CascadeShadowSplitSphereRadii);
+    weights.yzw = saturate(weights.yzw - weights.xyz);
+    return (uint)(4.0 - dot(weights, float4(4, 3, 2, 1)));
+}
+
+float4x4 GetShadowMatrix(uint cascadeIndex)
+{
+    float4x4 result = _MainLightWorldToShadow0;
+    result = (cascadeIndex == 1) ? _MainLightWorldToShadow1 : result;
+    result = (cascadeIndex == 2) ? _MainLightWorldToShadow2 : result;
+    result = (cascadeIndex >= 3) ? _MainLightWorldToShadow3 : result;
+    return result;
+}
+
+float SampleAllCascadeShadowMap(float3 worldPos, float3 normal)
+{
+    if (_UseShadows == 0)
+        return 1.0;
+
+    float3 biasedPos = worldPos + normal * _MainLightShadowParams.z;
+
+    float shadow = 1;
+    for(uint cascadeIndex = 0; cascadeIndex < 4; cascadeIndex++)
+    {
+        if (cascadeIndex >= _ShadowCascadeCount)
+            break;
+
+        float4x4 shadowMatrix = GetShadowMatrix(cascadeIndex);
+        float4 shadowCoord = mul(shadowMatrix, float4(biasedPos, 1.0));
+
+        if (shadowCoord.z <= 0.0 || shadowCoord.z >= 1.0)
+            continue;
+
+        shadow = min(shadow, _MainLightShadowMap.SampleCmpLevelZero(
+            sampler_MainLightShadowMap, shadowCoord.xy, shadowCoord.z));
+    }
+
+    return lerp(1.0, shadow, _MainLightShadowParams.x);
+}
+
+DDGIVolumeParams BuildVolumeParams()
+{
+    DDGIVolumeParams params;
+    params.origin = _VolumeOrigin.xyz;
+    params.probeSpacing = _VolumeSpacing.xyz;
+    params.probeCounts = _VolumeProbeCounts.xyz;
+    params.normalBias = _NormalBias;
+    params.viewBias = _ViewBias;
+    params.irradianceGamma = _IrradianceGamma;
+    params.irradianceProbeRes = (int)_IrradianceAtlasParams.z;
+    params.distanceProbeRes = (int)_DistanceAtlasParams.z;
+    params.probesPerRow = (int)_IrradianceAtlasParams.w;
+    params.irradianceTexelSize = _IrradianceAtlasParams.xy;
+    params.distanceTexelSize = _DistanceAtlasParams.xy;
+    return params;
+}
+
+[numthreads(64, 1, 1)]
+void CSLightingCombined(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint linearIndex = dispatchID.x;
+
+    uint2 texCoord = uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+
+    if (texCoord.x >= _GBufferWidth || texCoord.y >= _GBufferHeight)
+        return;
+
+    float4 positionDistance = _GBuffer_PositionDistance[texCoord];
+    float4 normalHitFlag = _GBuffer_NormalHitFlag[texCoord];
+    float4 albedoRoughness = _GBuffer_AlbedoRoughness[texCoord];
+    float4 emissionMetallic = _GBuffer_EmissionMetallic[texCoord];
+
+    float3 hitPosition = positionDistance.xyz;
+    float hitDistance = positionDistance.w;
+    float3 hitNormal = normalHitFlag.xyz;
+    float hitFlag = normalHitFlag.w;
+    float3 albedo = albedoRoughness.rgb;
+    float3 emission = emissionMetallic.rgb;
+
+    if (hitFlag < 0.5)
+    {
+        _RadianceBuffer[texCoord] = float4(emission, hitDistance);
+        return;
+    }
+
+    hitNormal = normalize(hitNormal);
+
+    float3 directIrradiance = 0;
+
+    if (hitDistance >= 0)
+    {
+
+        {
+            float3 lightDir = normalize(_MainLightDirection.xyz);
+            float3 lightColor = _MainLightColor.rgb * _MainLightColor.w;
+            float NdotL = saturate(dot(hitNormal, lightDir));
+            float shadow = SampleAllCascadeShadowMap(hitPosition, hitNormal);
+            directIrradiance += lightColor * NdotL * shadow;
+        }
+
+        for (uint i = 0; i < _AdditionalLightCount && i < MAX_ADDITIONAL_LIGHTS; i++)
+        {
+            float3 lightPos = _AdditionalLightPositions[i].xyz;
+            float lightRange = _AdditionalLightPositions[i].w;
+            float3 lightColor = _AdditionalLightColors[i].rgb * _AdditionalLightColors[i].w;
+            float3 spotDir = _AdditionalLightDirections[i].xyz;
+            float spotAngle = _AdditionalLightDirections[i].w;
+
+            float3 toLight = lightPos - hitPosition;
+            float distanceSq = dot(toLight, toLight);
+            float distance = sqrt(distanceSq);
+            float3 lightDir = toLight * rcp(max(distance, 0.0001));
+
+            float rangeSq = lightRange * lightRange;
+            float attenuation = PointLightAttenuation(distanceSq, rangeSq);
+
+            if (spotAngle > 0.001)
+            {
+                attenuation *= SpotLightAttenuation(lightDir, spotDir, spotAngle);
+            }
+
+            float NdotL = saturate(dot(hitNormal, lightDir));
+            directIrradiance += lightColor * NdotL * attenuation;
+        }
+    }
+
+    float3 indirectIrradiance = 0;
+
+    if (hitDistance >= 0)
+    {
+        DDGIVolumeParams volume = BuildVolumeParams();
+        float3 surfaceBias = DDGIGetSurfaceBias(hitNormal, hitNormal, volume);
+
+        indirectIrradiance = DDGIGetVolumeIrradianceWithProbeState(
+            hitPosition,
+            surfaceBias,
+            hitNormal,
+            volume,
+            _IrradianceAtlas_Prev,
+            _DistanceAtlas_Prev,
+            _ProbeData,
+            _ProbeDataWidth
+        );
+
+        indirectIrradiance *= _IndirectIntensity;
+    }
+
+    float3 totalIrradiance = directIrradiance + indirectIrradiance;
+    float3 outgoingRadiance = emission + albedo * (totalIrradiance * (1.0 / PI));
+
+    _RadianceBuffer[texCoord] = float4(outgoingRadiance, hitDistance);
+}

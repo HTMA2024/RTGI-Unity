@@ -1,0 +1,290 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Sampling/Sampling.hlsl"
+#include "SSGICommon.hlsl"
+#include "SSGITypes.hlsl"
+#include "SSGIRayMarching.hlsl"
+
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel TraceGlobalIllumination          TRACE_GLOBAL_ILLUMINATION=TraceGlobalIllumination GI_TRACE
+#pragma kernel TraceGlobalIlluminationHalf      TRACE_GLOBAL_ILLUMINATION=TraceGlobalIlluminationHalf GI_TRACE HALF_RES
+#pragma kernel ReprojectGlobalIllumination      REPROJECT_GLOBAL_ILLUMINATION=ReprojectGlobalIllumination GI_REPROJECT
+#pragma kernel ReprojectGlobalIlluminationHalf  REPROJECT_GLOBAL_ILLUMINATION=ReprojectGlobalIlluminationHalf GI_REPROJECT HALF_RES
+#pragma kernel ReprojectGlobalIlluminationDeferred      REPROJECT_GLOBAL_ILLUMINATION=ReprojectGlobalIlluminationDeferred GI_REPROJECT SSGI_DEFERRED_LIGHTING
+#pragma kernel ReprojectGlobalIlluminationDeferredHalf  REPROJECT_GLOBAL_ILLUMINATION=ReprojectGlobalIlluminationDeferredHalf GI_REPROJECT HALF_RES SSGI_DEFERRED_LIGHTING
+
+#pragma multi_compile _ _SSGI_ACCURATE_NORMALS
+
+#define INDIRECT_DIFFUSE_TILE_SIZE 8
+
+#define SSGI_MIP_OFFSET 1
+
+#define SSGI_CLAMP_VALUE 7.0
+
+RWTexture2D<float2> _IndirectDiffuseHitPointTextureRW;
+
+Texture2D<float4>   _ColorPyramidTexture;
+Texture2D<float2>   _IndirectDiffuseHitPointTexture;
+Texture2D<float>    _HistoryDepthTexture;
+
+float4 _ColorPyramidMip1Params;
+
+RWTexture2D<float3> _IndirectDiffuseTextureRW;
+
+Texture2D<float4> _GBuffer0;
+
+Texture2D<float3> _PrevIndirectDiffuseTexture;
+
+int _SSGIMultiBounce;
+
+#ifdef SSGI_DEFERRED_LIGHTING
+
+Texture2D<float4> _GBuffer1;
+Texture2D<float4> _GBuffer2;
+
+RWTexture2D<float4> _SSGIGBuffer0RW;
+RWTexture2D<float4> _SSGIGBuffer1RW;
+RWTexture2D<float4> _SSGIGBuffer2RW;
+RWTexture2D<float4> _SSGIHitPositionNDCRW;
+#endif
+
+RWTexture2D<float> _RTGIHitValidityMask;
+
+int _SSGIDebugMode;
+RWTexture2D<float4> _SSGIDebugOutputRW;
+
+#define DEPTH_DIFFERENCE_THRESHOLD 0.1
+
+float4 _SSGISHAr;
+float4 _SSGISHAg;
+float4 _SSGISHAb;
+float4 _SSGISHBr;
+float4 _SSGISHBg;
+float4 _SSGISHBb;
+float4 _SSGISHC;
+
+float3 EvaluateSkyFallback(float3 normalWS)
+{
+    float4 normalWS4 = float4(normalWS, 1.0);
+
+    float3 res;
+    res.r = dot(_SSGISHAr, normalWS4);
+    res.g = dot(_SSGISHAg, normalWS4);
+    res.b = dot(_SSGISHAb, normalWS4);
+
+    float4 vB;
+    vB.r = dot(_SSGISHBr, normalWS4 * normalWS4.xyzz);
+    vB.g = dot(_SSGISHBg, normalWS4 * normalWS4.xyzz);
+    vB.b = dot(_SSGISHBb, normalWS4 * normalWS4.xyzz);
+
+    float vC = dot(_SSGISHC.rgb, normalWS * normalWS - normalWS.y * normalWS.y);
+    res += vB.rgb + vC;
+    return max(0.0, res);
+}
+
+[numthreads(INDIRECT_DIFFUSE_TILE_SIZE, INDIRECT_DIFFUSE_TILE_SIZE, 1)]
+void TRACE_GLOBAL_ILLUMINATION(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 currentCoord = dispatchThreadId.xy;
+    uint2 inputCoord   = dispatchThreadId.xy;
+
+#ifdef HALF_RES
+    inputCoord = GetLowResCoord(inputCoord);
+#endif
+
+    float deviceDepth = _DepthPyramidTexture[inputCoord];
+
+    _IndirectDiffuseHitPointTextureRW[currentCoord] = float2(99.0, 0.0);
+
+    float3 normalWS = DecodeNormalURP(inputCoord);
+
+    float2 noiseSample;
+    noiseSample.x = GetBNDSequenceSample(currentCoord.xy, _IndirectDiffuseFrameIndex, 0);
+    noiseSample.y = GetBNDSequenceSample(currentCoord.xy, _IndirectDiffuseFrameIndex, 1);
+
+    float3 sampleDir = SampleHemisphereCosine(noiseSample.x, noiseSample.y, normalWS);
+
+    bool killRay = deviceDepth == UNITY_RAW_FAR_CLIP_VALUE;
+
+    float2 positionNDC = (inputCoord + 0.5) * _SSGIScreenSize.zw;
+#if UNITY_UV_STARTS_AT_TOP
+    positionNDC.y = 1.0 - positionNDC.y;
+#endif
+    float4 positionCS  = float4(positionNDC * 2.0 - 1.0, deviceDepth, 1.0);
+    float4 positionWS4 = mul(UNITY_MATRIX_I_VP, positionCS);
+    float3 positionWS  = positionWS4.xyz * rcp(positionWS4.w);
+
+    float3 viewWS = normalize(-positionWS);
+
+    positionWS = positionWS * (1 - 0.001 * rcp(max(dot(normalWS, viewWS), FLT_EPS)));
+    deviceDepth = ComputeNormalizedDeviceCoordinatesWithZ(positionWS, UNITY_MATRIX_VP).z;
+
+    float3 rayPos;
+    bool hit = RayMarch(positionWS, sampleDir, normalWS, inputCoord, deviceDepth, killRay, rayPos);
+
+    if (hit)
+    {
+        float2 hitPositionNDC = floor(rayPos.xy) * _SSGIScreenSize.zw + (0.5 * _SSGIScreenSize.zw);
+        _IndirectDiffuseHitPointTextureRW[currentCoord] = hitPositionNDC;
+    }
+
+    if (_SSGIDebugMode == 8)
+        _SSGIDebugOutputRW[currentCoord] = float4(sampleDir * 0.5 + 0.5, 1.0);
+}
+
+[numthreads(INDIRECT_DIFFUSE_TILE_SIZE, INDIRECT_DIFFUSE_TILE_SIZE, 1)]
+void REPROJECT_GLOBAL_ILLUMINATION(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 currentCoord = dispatchThreadId.xy;
+    uint2 inputCoord   = dispatchThreadId.xy;
+
+#ifdef HALF_RES
+    inputCoord = GetLowResCoord(inputCoord);
+#endif
+
+    float deviceDepth = _DepthPyramidTexture[inputCoord];
+
+    float3 normalWS = DecodeNormalURP(inputCoord);
+
+    float2 noiseSample;
+    noiseSample.x = GetBNDSequenceSample(currentCoord.xy, _IndirectDiffuseFrameIndex, 0);
+    noiseSample.y = GetBNDSequenceSample(currentCoord.xy, _IndirectDiffuseFrameIndex, 1);
+    float3 sampleDir = SampleHemisphereCosine(noiseSample.x, noiseSample.y, normalWS);
+
+    float2 hitPositionNDC = LOAD_TEXTURE2D(_IndirectDiffuseHitPointTexture, dispatchThreadId.xy).xy;
+
+    uint2 hitPixelCoord = (uint2)(hitPositionNDC * _SSGIScreenSize.xy);
+    float hitPointDepth = _DepthPyramidTexture[hitPixelCoord];
+
+    bool invalid = false;
+
+    invalid = hitPositionNDC.x > 1.0;
+
+    float4 motionVectorRaw = LOAD_TEXTURE2D(_CameraMotionVectorsTexture, hitPixelCoord);
+    float2 motionVectorNDC = (motionVectorRaw.x > 1.0) ? 0.0 : motionVectorRaw.xy;
+    float2 prevFrameNDC = hitPositionNDC - motionVectorNDC;
+
+    float2 uvOutOfBounds = float2(
+        (prevFrameNDC.x >= 0.0) * (prevFrameNDC.x <= 1.0),
+        (prevFrameNDC.y >= 0.0) * (prevFrameNDC.y <= 1.0));
+    invalid = invalid || (uvOutOfBounds.x * uvOutOfBounds.y < 0.5);
+
+    uint2 prevPixelCoord = (uint2)(prevFrameNDC * _SSGIScreenSize.xy);
+    float hitPointHistoryDepth = _HistoryDepthTexture[prevPixelCoord];
+    invalid = invalid || (abs(hitPointHistoryDepth - hitPointDepth) > DEPTH_DIFFERENCE_THRESHOLD);
+
+    float3 color = 0.0;
+    bool hitValid = !invalid;
+
+#ifdef SSGI_DEFERRED_LIGHTING
+
+    if (hitValid)
+    {
+
+        _SSGIGBuffer0RW[currentCoord] = LOAD_TEXTURE2D(_GBuffer0, hitPixelCoord);
+        _SSGIGBuffer1RW[currentCoord] = LOAD_TEXTURE2D(_GBuffer1, hitPixelCoord);
+        _SSGIGBuffer2RW[currentCoord] = float4(DecodeNormalURP(hitPixelCoord), 1);
+
+        _SSGIHitPositionNDCRW[currentCoord] = float4(hitPositionNDC, hitPointDepth, 1.0);
+    }
+    else
+    {
+
+        _SSGIGBuffer0RW[currentCoord] = 0.0;
+        _SSGIGBuffer1RW[currentCoord] = 0.0;
+        _SSGIGBuffer2RW[currentCoord] = 0.0;
+        _SSGIHitPositionNDCRW[currentCoord] = float4(0.0, 0.0, 0.0, 0.0);
+
+        if (RAYMARCHINGFALLBACKHIERARCHY_SKY & _RayMarchingFallbackHierarchy)
+            color = EvaluateSkyFallback(normalWS);
+    }
+
+    _RTGIHitValidityMask[inputCoord] = hitValid ? 1.0 : 0.0;
+
+#else
+
+    if (hitValid)
+    {
+
+        float2 mip1Offset = _ColorPyramidMip1Params.xy;
+        float2 mip1Size   = _ColorPyramidMip1Params.zw;
+
+        float2 atlasCoordF = prevFrameNDC * mip1Size + mip1Offset;
+
+        float2 texelF = atlasCoordF - 0.5;
+        int2 texel00 = int2(floor(texelF));
+        float2 frac2 = texelF - texel00;
+
+        int2 mip1Min = int2(mip1Offset);
+        int2 mip1Max = int2(mip1Offset + mip1Size) - 1;
+        int2 t00 = clamp(texel00, mip1Min, mip1Max);
+        int2 t10 = clamp(texel00 + int2(1, 0), mip1Min, mip1Max);
+        int2 t01 = clamp(texel00 + int2(0, 1), mip1Min, mip1Max);
+        int2 t11 = clamp(texel00 + int2(1, 1), mip1Min, mip1Max);
+
+        float3 c00 = _ColorPyramidTexture[t00].rgb;
+        float3 c10 = _ColorPyramidTexture[t10].rgb;
+        float3 c01 = _ColorPyramidTexture[t01].rgb;
+        float3 c11 = _ColorPyramidTexture[t11].rgb;
+
+        color = lerp(lerp(c00, c10, frac2.x), lerp(c01, c11, frac2.x), frac2.y);
+
+        if (_SSGIMultiBounce)
+        {
+            float3 hitAlbedo = LOAD_TEXTURE2D(_GBuffer0, hitPixelCoord).rgb;
+            float3 prevGI = SAMPLE_TEXTURE2D_LOD(_PrevIndirectDiffuseTexture, sampler_LinearClamp,
+                hitPositionNDC, 0).rgb;
+
+            color += hitAlbedo * prevGI;
+        }
+    }
+    else
+    {
+
+        float weight = 0.0;
+        if (RAYMARCHINGFALLBACKHIERARCHY_SKY & _RayMarchingFallbackHierarchy)
+        {
+            color = EvaluateSkyFallback(normalWS);
+            weight = 1.0;
+        }
+    }
+#endif
+
+    color = IsNaN(color.x) ? 0.0 : color;
+
+#ifdef SSGI_DEFERRED_LIGHTING
+
+    if (!hitValid)
+    {
+        color = RgbToHsv(color);
+        color.z = min(color.z, SSGI_CLAMP_VALUE);
+        color = HsvToRgb(color);
+    }
+    _IndirectDiffuseTextureRW[currentCoord] = color;
+#else
+
+    color = RgbToHsv(color);
+    color.z = min(color.z, SSGI_CLAMP_VALUE);
+    color = HsvToRgb(color);
+
+    _IndirectDiffuseTextureRW[currentCoord] = color;
+#endif
+
+    if (_SSGIDebugMode == 9)
+    {
+
+        float4 validityColor = float4(0.0, 1.0, 0.0, 1.0);
+        if (hitPositionNDC.x > 1.0)
+            validityColor = float4(1.0, 0.0, 0.0, 1.0);
+        else if (abs(hitPointHistoryDepth - hitPointDepth) > DEPTH_DIFFERENCE_THRESHOLD)
+            validityColor = float4(0.0, 0.0, 1.0, 1.0);
+        else if (uvOutOfBounds.x * uvOutOfBounds.y < 0.5)
+            validityColor = float4(1.0, 1.0, 0.0, 1.0);
+        _SSGIDebugOutputRW[currentCoord] = validityColor;
+    }
+    else if (_SSGIDebugMode == 11)
+    {
+        _SSGIDebugOutputRW[currentCoord] = float4(prevFrameNDC, 0.0, 1.0);
+    }
+}

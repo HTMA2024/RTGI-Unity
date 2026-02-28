@@ -1,0 +1,284 @@
+#pragma kernel CSUpdateProbes
+#pragma kernel CSUpdateBorder
+#pragma kernel CSClearAtlas
+
+#define PI 3.14159265359
+#define TWO_PI 6.28318530718
+#define GOLDEN_RATIO 1.61803398875
+
+RWTexture2D<float4> _IrradianceAtlas;
+RWTexture2D<float2> _DistanceAtlas;
+
+Texture2D<float4> _IrradianceAtlasPrev;
+Texture2D<float2> _DistanceAtlasPrev;
+
+StructuredBuffer<float4> _ProbePositions;
+StructuredBuffer<float4> _ProbeAtlasCoords;
+
+float4 _AmbientLight;
+float4 _MainLightDirection;
+float4 _MainLightColor;
+float4 _SkyColorTop;
+float4 _SkyColorBottom;
+
+float4 _VolumeOrigin;
+float4 _VolumeSpacing;
+int4 _VolumeProbeCounts;
+
+int4 _IrradianceAtlasSize;
+int4 _DistanceAtlasSize;
+int _GutterSize;
+
+float _Hysteresis;
+float _IrradianceGamma;
+float _MaxRayDistance;
+int _RaysPerProbe;
+int _FrameIndex;
+float _RandomRotation;
+
+float3 SphericalFibonacci(int index, int numSamples)
+{
+    float phi = index * 2.4f;
+    float cosTheta = 1.0f - (2.0f * index + 1.0f) / (float)numSamples;
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+
+    return float3(
+        cos(phi) * sinTheta,
+        cosTheta,
+        sin(phi) * sinTheta
+    );
+}
+
+float3x3 RotationMatrixY(float angle)
+{
+    float c = cos(angle);
+    float s = sin(angle);
+    return float3x3(
+        c, 0, s,
+        0, 1, 0,
+        -s, 0, c
+    );
+}
+
+float3x3 RandomRotationMatrix(float seed)
+{
+    float angle1 = seed * TWO_PI;
+    float angle2 = frac(seed * 1.618) * TWO_PI;
+
+    float3x3 rotY = RotationMatrixY(angle1);
+
+    float c = cos(angle2);
+    float s = sin(angle2);
+    float3x3 rotX = float3x3(
+        1, 0, 0,
+        0, c, -s,
+        0, s, c
+    );
+
+    return mul(rotX, rotY);
+}
+
+float2 OctahedronEncode(float3 n)
+{
+    float sum = abs(n.x) + abs(n.y) + abs(n.z);
+    n.xy /= sum;
+
+    if (n.z < 0.0)
+    {
+        float2 signNotZero = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * signNotZero;
+    }
+
+    return n.xy * 0.5 + 0.5;
+}
+
+float3 OctahedronDecode(float2 uv)
+{
+    uv = uv * 2.0 - 1.0;
+
+    float3 n = float3(uv.x, uv.y, 1.0 - abs(uv.x) - abs(uv.y));
+
+    if (n.z < 0.0)
+    {
+        float2 signNotZero = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * signNotZero;
+    }
+
+    return normalize(n);
+}
+
+float3 SampleSkyColor(float3 direction)
+{
+    float t = direction.y * 0.5 + 0.5;
+    return lerp(_SkyColorBottom.rgb, _SkyColorTop.rgb, t);
+}
+
+float3 ComputeDirectLighting(float3 direction)
+{
+
+    float ndotl = max(0.0, dot(direction, -_MainLightDirection.xyz));
+    float3 directLight = _MainLightColor.rgb * _MainLightColor.w * ndotl;
+
+    float3 skyLight = SampleSkyColor(direction);
+
+    float3 ambient = _AmbientLight.rgb * _AmbientLight.w;
+
+    return directLight + skyLight + ambient;
+}
+
+int2 GetProbePixelCoord(int probeIndex, int probeResolution, int probesPerRow, int gutterSize)
+{
+    int probeX = probeIndex % probesPerRow;
+    int probeY = probeIndex / probesPerRow;
+
+    int probeSizeWithGutter = probeResolution + gutterSize * 2;
+
+    return int2(
+        probeX * probeSizeWithGutter + gutterSize,
+        probeY * probeSizeWithGutter + gutterSize
+    );
+}
+
+[numthreads(8, 8, 1)]
+void CSUpdateProbes(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    int probeIndex = dispatchThreadId.z;
+
+    if (probeIndex >= _VolumeProbeCounts.w)
+        return;
+
+    float4 probeData = _ProbePositions[probeIndex];
+    float3 probePos = probeData.xyz;
+    float probeState = probeData.w;
+
+    if (probeState < 0.5)
+        return;
+
+    int2 localPixel = int2(dispatchThreadId.xy);
+
+    if (localPixel.x < _IrradianceAtlasSize.z && localPixel.y < _IrradianceAtlasSize.z)
+    {
+
+        float2 uv = (float2(localPixel) + 0.5) / float(_IrradianceAtlasSize.z);
+        float3 direction = OctahedronDecode(uv);
+
+        float3x3 rotMatrix = RandomRotationMatrix(_RandomRotation + probeIndex * 0.1);
+
+        float3 irradianceSum = float3(0, 0, 0);
+        float distanceSum = 0.0;
+        float distanceSqSum = 0.0;
+        float weightSum = 0.0;
+
+        {
+
+            float3 sampleDir = direction;
+
+            float3 radiance = ComputeDirectLighting(sampleDir);
+
+            float cosWeight = max(0.0, dot(direction, sampleDir));
+
+            irradianceSum += radiance * cosWeight;
+            weightSum += cosWeight;
+
+            distanceSum += _MaxRayDistance;
+            distanceSqSum += _MaxRayDistance * _MaxRayDistance;
+        }
+
+        float3 newIrradiance = weightSum > 0.0 ? irradianceSum / weightSum : float3(0, 0, 0);
+
+        newIrradiance = pow(max(newIrradiance, 0.0001), 1.0 / _IrradianceGamma);
+
+        int2 irradianceBaseCoord = GetProbePixelCoord(probeIndex, _IrradianceAtlasSize.z, _IrradianceAtlasSize.w, _GutterSize);
+        int2 irradiancePixel = irradianceBaseCoord + localPixel;
+
+        float4 oldIrradiance = _IrradianceAtlasPrev[irradiancePixel];
+
+        float3 finalIrradiance = lerp(newIrradiance, oldIrradiance.rgb, _Hysteresis);
+
+        _IrradianceAtlas[irradiancePixel] = float4(finalIrradiance, 1.0);
+    }
+
+    if (localPixel.x < _DistanceAtlasSize.z && localPixel.y < _DistanceAtlasSize.z)
+    {
+        float newDistance = _MaxRayDistance;
+        float newDistanceSq = _MaxRayDistance * _MaxRayDistance;
+
+        int2 distanceBaseCoord = GetProbePixelCoord(probeIndex, _DistanceAtlasSize.z, _DistanceAtlasSize.w, _GutterSize);
+        int2 distancePixel = distanceBaseCoord + localPixel;
+
+        float2 oldDistance = _DistanceAtlasPrev[distancePixel];
+        float2 finalDistance = lerp(float2(newDistance, newDistanceSq), oldDistance, _Hysteresis);
+
+        _DistanceAtlas[distancePixel] = finalDistance;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSUpdateBorder(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    int probeIndex = dispatchThreadId.x;
+
+    if (probeIndex >= _VolumeProbeCounts.w)
+        return;
+
+    {
+        int probeRes = _IrradianceAtlasSize.z;
+        int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _IrradianceAtlasSize.w, _GutterSize);
+
+        for (int row = 0; row < probeRes; row++)
+        {
+            _IrradianceAtlas[baseCoord + int2(-1, row)] = _IrradianceAtlas[baseCoord + int2(0, probeRes - 1 - row)];
+            _IrradianceAtlas[baseCoord + int2(probeRes, row)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1 - row)];
+        }
+
+        for (int col = 0; col < probeRes; col++)
+        {
+            _IrradianceAtlas[baseCoord + int2(col, -1)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1 - col, 0)];
+            _IrradianceAtlas[baseCoord + int2(col, probeRes)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1 - col, probeRes - 1)];
+        }
+
+        _IrradianceAtlas[baseCoord + int2(-1, -1)] = _IrradianceAtlas[baseCoord + int2(0, 0)];
+        _IrradianceAtlas[baseCoord + int2(probeRes, -1)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, 0)];
+        _IrradianceAtlas[baseCoord + int2(-1, probeRes)] = _IrradianceAtlas[baseCoord + int2(0, probeRes - 1)];
+        _IrradianceAtlas[baseCoord + int2(probeRes, probeRes)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1)];
+    }
+
+    {
+        int probeRes = _DistanceAtlasSize.z;
+        int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _DistanceAtlasSize.w, _GutterSize);
+
+        for (int row = 0; row < probeRes; row++)
+        {
+            _DistanceAtlas[baseCoord + int2(-1, row)] = _DistanceAtlas[baseCoord + int2(0, probeRes - 1 - row)];
+            _DistanceAtlas[baseCoord + int2(probeRes, row)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1 - row)];
+        }
+
+        for (int col = 0; col < probeRes; col++)
+        {
+            _DistanceAtlas[baseCoord + int2(col, -1)] = _DistanceAtlas[baseCoord + int2(probeRes - 1 - col, 0)];
+            _DistanceAtlas[baseCoord + int2(col, probeRes)] = _DistanceAtlas[baseCoord + int2(probeRes - 1 - col, probeRes - 1)];
+        }
+
+        _DistanceAtlas[baseCoord + int2(-1, -1)] = _DistanceAtlas[baseCoord + int2(0, 0)];
+        _DistanceAtlas[baseCoord + int2(probeRes, -1)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, 0)];
+        _DistanceAtlas[baseCoord + int2(-1, probeRes)] = _DistanceAtlas[baseCoord + int2(0, probeRes - 1)];
+        _DistanceAtlas[baseCoord + int2(probeRes, probeRes)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1)];
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSClearAtlas(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    if (dispatchThreadId.x < (uint)_IrradianceAtlasSize.x &&
+        dispatchThreadId.y < (uint)_IrradianceAtlasSize.y)
+    {
+        _IrradianceAtlas[dispatchThreadId.xy] = float4(0, 0, 0, 0);
+    }
+
+    if (dispatchThreadId.x < (uint)_DistanceAtlasSize.x &&
+        dispatchThreadId.y < (uint)_DistanceAtlasSize.y)
+    {
+
+        _DistanceAtlas[dispatchThreadId.xy] = float2(0, 0);
+    }
+}

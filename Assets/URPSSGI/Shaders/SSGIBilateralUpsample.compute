@@ -1,0 +1,70 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "SSGIBilateralUpsample.hlsl"
+
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel BilateralUpSampleColor
+
+#define BILATERAL_UPSAMPLE_TILE_SIZE 8
+
+CBUFFER_START(ShaderVariablesBilateralUpsample)
+    float4 _HalfScreenSize;
+CBUFFER_END
+
+Texture2D<float>  _DepthPyramidTexture;
+
+Texture2D<float3> _LowResolutionTexture;
+
+RWTexture2D<float3> _OutputUpscaledTexture;
+
+float _RayMarchingLowResPercentage;
+float4 _SSGIScreenSize;
+
+SamplerState sampler_LinearClamp;
+SamplerState sampler_PointClamp;
+
+float2 ClampAndScaleUVForBilinear(float2 UV)
+{
+    float2 maxCoord = 1.0 - 0.5 * _HalfScreenSize.zw;
+    return min(UV, maxCoord);
+}
+
+[numthreads(BILATERAL_UPSAMPLE_TILE_SIZE, BILATERAL_UPSAMPLE_TILE_SIZE, 1)]
+void BilateralUpSampleColor(uint3 currentCoord : SV_DispatchThreadID)
+{
+
+    if (any(currentCoord.xy >= (uint2)_SSGIScreenSize.xy))
+        return;
+
+    float4 depthNeighborhood = float4(
+        LOAD_TEXTURE2D(_DepthPyramidTexture, currentCoord.xy + uint2(0, 1)).x,
+        LOAD_TEXTURE2D(_DepthPyramidTexture, currentCoord.xy + uint2(1, 1)).x,
+        LOAD_TEXTURE2D(_DepthPyramidTexture, currentCoord.xy + uint2(1, 0)).x,
+        LOAD_TEXTURE2D(_DepthPyramidTexture, currentCoord.xy + uint2(0, 0)).x);
+
+    float closestDepth = max(depthNeighborhood.x, max(depthNeighborhood.y, max(depthNeighborhood.z, depthNeighborhood.w)));
+
+    float2 uvAtLowRes = min(currentCoord.xy * _RayMarchingLowResPercentage + 0.5, _HalfScreenSize.xy - 1) * _HalfScreenSize.zw;
+    float2 sampleUV = ClampAndScaleUVForBilinear(uvAtLowRes);
+
+    float2 samplePixel = sampleUV * _HalfScreenSize.xy;
+    float2 bottomRight = frac(samplePixel + 0.5);
+    float2 topLeft = 1.0 - bottomRight;
+    float4 linearWeights = float4(
+        topLeft.x * bottomRight.y,
+        bottomRight.x * bottomRight.y,
+        bottomRight.x * topLeft.y,
+        topLeft.x * topLeft.y);
+
+    float4 reds   = GATHER_RED_TEXTURE2D(_LowResolutionTexture, sampler_LinearClamp, sampleUV);
+    float4 greens = GATHER_GREEN_TEXTURE2D(_LowResolutionTexture, sampler_LinearClamp, sampleUV);
+    float4 blues  = GATHER_BLUE_TEXTURE2D(_LowResolutionTexture, sampler_LinearClamp, sampleUV);
+
+    float3 s0 = float3(reds.x, greens.x, blues.x);
+    float3 s1 = float3(reds.y, greens.y, blues.y);
+    float3 s2 = float3(reds.z, greens.z, blues.z);
+    float3 s3 = float3(reds.w, greens.w, blues.w);
+
+    _OutputUpscaledTexture[currentCoord.xy] = BilUpColor3WithWeight(closestDepth, depthNeighborhood, s0, s1, s2, s3, linearWeights);
+}

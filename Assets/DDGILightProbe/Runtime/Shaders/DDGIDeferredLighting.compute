@@ -1,0 +1,214 @@
+#pragma kernel CSDeferredLighting
+
+#include "UnityCG.cginc"
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+Texture2D<float4> _GBuffer_AlbedoRoughness;
+Texture2D<float4> _GBuffer_EmissionMetallic;
+
+RWTexture2D<float4> _DirectIrradianceBuffer;
+
+float4 _MainLightDirection;
+float4 _MainLightColor;
+
+#define MAX_ADDITIONAL_LIGHTS 8
+float4 _AdditionalLightPositions[MAX_ADDITIONAL_LIGHTS];
+float4 _AdditionalLightColors[MAX_ADDITIONAL_LIGHTS];
+float4 _AdditionalLightDirections[MAX_ADDITIONAL_LIGHTS];
+uint _AdditionalLightCount;
+
+Texture2D<float> _MainLightShadowMap;
+SamplerComparisonState sampler_MainLightShadowMap;
+
+float4x4 _MainLightWorldToShadow0;
+float4x4 _MainLightWorldToShadow1;
+float4x4 _MainLightWorldToShadow2;
+float4x4 _MainLightWorldToShadow3;
+
+float4 _CascadeShadowSplitSpheres0;
+float4 _CascadeShadowSplitSpheres1;
+float4 _CascadeShadowSplitSpheres2;
+float4 _CascadeShadowSplitSpheres3;
+float4 _CascadeShadowSplitSphereRadii;
+
+float4 _MainLightShadowParams;
+uint _UseShadows;
+uint _ShadowCascadeCount;
+
+uint _GBufferWidth;
+uint _GBufferHeight;
+uint _RaysPerProbe;
+uint _ProbeCount;
+
+float PointLightAttenuation(float distanceSq, float rangeSq)
+{
+    float factor = distanceSq * rcp(rangeSq);
+    float smoothFactor = saturate(1.0 - factor * factor);
+
+    return smoothFactor * smoothFactor * rcp(max(distanceSq, 0.0001));
+}
+
+float SpotLightAttenuation(float3 lightDir, float3 spotDir, float spotAngle)
+{
+    float cosAngle = dot(-lightDir, spotDir);
+    float cosOuter = cos(spotAngle * 0.5);
+    float cosInner = cos(spotAngle * 0.25);
+    return saturate((cosAngle - cosOuter) * rcp(cosInner - cosOuter));
+}
+
+uint ComputeCascadeIndex(float3 positionWS)
+{
+
+    float3 fromCenter0 = positionWS - _CascadeShadowSplitSpheres0.xyz;
+    float3 fromCenter1 = positionWS - _CascadeShadowSplitSpheres1.xyz;
+    float3 fromCenter2 = positionWS - _CascadeShadowSplitSpheres2.xyz;
+    float3 fromCenter3 = positionWS - _CascadeShadowSplitSpheres3.xyz;
+
+    float4 distances2 = float4(
+        dot(fromCenter0, fromCenter0),
+        dot(fromCenter1, fromCenter1),
+        dot(fromCenter2, fromCenter2),
+        dot(fromCenter3, fromCenter3)
+    );
+
+    float4 weights = float4(distances2 < _CascadeShadowSplitSphereRadii);
+
+    weights.yzw = saturate(weights.yzw - weights.xyz);
+
+    return (uint)(4.0 - dot(weights, float4(4, 3, 2, 1)));
+}
+
+float4x4 GetShadowMatrix(uint cascadeIndex)
+{
+
+    float4x4 result = _MainLightWorldToShadow0;
+    result = (cascadeIndex == 1) ? _MainLightWorldToShadow1 : result;
+    result = (cascadeIndex == 2) ? _MainLightWorldToShadow2 : result;
+    result = (cascadeIndex >= 3) ? _MainLightWorldToShadow3 : result;
+    return result;
+}
+
+float SampleShadowMap(float3 worldPos, float3 normal)
+{
+    if (_UseShadows == 0)
+        return 1.0;
+
+    float3 biasedPos = worldPos + normal * _MainLightShadowParams.z;
+
+    uint cascadeIndex = ComputeCascadeIndex(biasedPos);
+
+    if (cascadeIndex >= _ShadowCascadeCount)
+        return 1.0;
+
+    float4x4 shadowMatrix = GetShadowMatrix(cascadeIndex);
+
+    float4 shadowCoord = mul(shadowMatrix, float4(biasedPos, 1.0));
+
+    if (shadowCoord.z <= 0.0 || shadowCoord.z >= 1.0)
+        return 1.0;
+
+    float shadow = _MainLightShadowMap.SampleCmpLevelZero(
+        sampler_MainLightShadowMap, shadowCoord.xy, shadowCoord.z);
+
+    return lerp(1.0, shadow, _MainLightShadowParams.x);
+}
+
+float SampleAllCascadeShadowMap(float3 worldPos, float3 normal)
+{
+    if (_UseShadows == 0)
+        return 1.0;
+
+    float3 biasedPos = worldPos + normal * _MainLightShadowParams.z;
+
+    float shadow = 1;
+    for(uint cascadeIndex = 0; cascadeIndex < 4; cascadeIndex++)
+    {
+
+        if (cascadeIndex >= _ShadowCascadeCount)
+            break;
+
+        float4x4 shadowMatrix = GetShadowMatrix(cascadeIndex);
+
+        float4 shadowCoord = mul(shadowMatrix, float4(biasedPos, 1.0));
+
+        if (shadowCoord.z <= 0.0 || shadowCoord.z >= 1.0)
+            continue;
+
+        shadow = min(shadow, _MainLightShadowMap.SampleCmpLevelZero(
+            sampler_MainLightShadowMap, shadowCoord.xy, shadowCoord.z)) ;
+    }
+
+    return lerp(1.0, shadow, _MainLightShadowParams.x);
+}
+
+[numthreads(64, 1, 1)]
+void CSDeferredLighting(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint linearIndex = dispatchID.x;
+
+    uint2 texCoord = uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+
+    if (texCoord.x >= _GBufferWidth || texCoord.y >= _GBufferHeight)
+        return;
+
+    float4 positionDistance = _GBuffer_PositionDistance[texCoord];
+    float4 normalHitFlag = _GBuffer_NormalHitFlag[texCoord];
+
+    float3 hitPosition = positionDistance.xyz;
+    float hitDistance = positionDistance.w;
+    float3 hitNormal = normalHitFlag.xyz;
+
+    float hitFlag = normalHitFlag.w;
+
+    if (hitFlag < 0.5 || hitDistance < 0)
+    {
+        _DirectIrradianceBuffer[texCoord] = float4(0, 0, 0, 1);
+        return;
+    }
+
+    hitNormal = normalize(hitNormal);
+
+    float3 totalIrradiance = 0;
+    float totalShadow = 1.0;
+
+    {
+        float3 lightDir = normalize(_MainLightDirection.xyz);
+        float3 lightColor = _MainLightColor.rgb * _MainLightColor.w;
+
+        float NdotL = saturate(dot(hitNormal, lightDir));
+
+        float shadow = SampleAllCascadeShadowMap(hitPosition, hitNormal);
+        totalShadow = shadow;
+
+        totalIrradiance += lightColor * NdotL * shadow;
+    }
+
+    for (uint i = 0; i < _AdditionalLightCount && i < MAX_ADDITIONAL_LIGHTS; i++)
+    {
+        float3 lightPos = _AdditionalLightPositions[i].xyz;
+        float lightRange = _AdditionalLightPositions[i].w;
+        float3 lightColor = _AdditionalLightColors[i].rgb * _AdditionalLightColors[i].w;
+        float3 spotDir = _AdditionalLightDirections[i].xyz;
+        float spotAngle = _AdditionalLightDirections[i].w;
+
+        float3 toLight = lightPos - hitPosition;
+        float distanceSq = dot(toLight, toLight);
+        float distance = sqrt(distanceSq);
+        float3 lightDir = toLight * rcp(max(distance, 0.0001));
+
+        float rangeSq = lightRange * lightRange;
+        float attenuation = PointLightAttenuation(distanceSq, rangeSq);
+
+        if (spotAngle > 0.001)
+        {
+            attenuation *= SpotLightAttenuation(lightDir, spotDir, spotAngle);
+        }
+
+        float NdotL = saturate(dot(hitNormal, lightDir));
+
+        totalIrradiance += lightColor * NdotL * attenuation;
+    }
+
+    _DirectIrradianceBuffer[texCoord] = float4(totalIrradiance, totalShadow);
+}

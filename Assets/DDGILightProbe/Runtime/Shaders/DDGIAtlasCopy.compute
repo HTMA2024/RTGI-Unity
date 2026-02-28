@@ -1,0 +1,29 @@
+#pragma kernel CSCopyIrradiance
+#pragma kernel CSCopyDistance
+
+Texture2D<float4>   _CopySrc4;
+RWTexture2D<float4> _CopyDst4;
+
+Texture2D<float2>   _CopySrc2;
+RWTexture2D<float2> _CopyDst2;
+
+uint _CopyWidth;
+uint _CopyHeight;
+
+[numthreads(8, 8, 1)]
+void CSCopyIrradiance(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _CopyWidth || id.y >= _CopyHeight)
+        return;
+
+    _CopyDst4[id.xy] = _CopySrc4[id.xy];
+}
+
+[numthreads(8, 8, 1)]
+void CSCopyDistance(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _CopyWidth || id.y >= _CopyHeight)
+        return;
+
+    _CopyDst2[id.xy] = _CopySrc2[id.xy];
+}

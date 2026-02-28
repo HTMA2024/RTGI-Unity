@@ -1,0 +1,570 @@
+// RTGIIndirectDiffuse.raytrace
+// DXR RayTracing Shader — RTGI Quality 模式
+// 核心流程：余弦加权半球采样 → DispatchRays → HSV 辐照度钳制 → 输出
+// 参考 HDRP RayTracingIndirectDiffuse.hlsl，适配 URP 管线
+//
+// 优化准则：
+//   - 无防御性编程，假定所有输入合法
+//   - 避免动态分支，用数学等价变换
+//   - rcp() 替代除法，saturate() 替代 clamp(x,0,1)
+//   - MAD 指令形式 a * x + b
+//   - 小整数次幂手动展开
+//   - 循环内不做与循环变量无关的计算
+//   - 使用内建函数（dot、lerp、saturate）
+
+#pragma max_recursion_depth 10
+
+// ─── 多弹射关键字（由 C# 端 cmd.SetRayTracingIntParam 控制） ──────────────────
+#pragma multi_compile _ MULTI_BOUNCE_INDIRECT
+
+// ─── AccurateNormals 参数（DXR RayTracingShader 不支持关键字，改用整数参数） ──
+// _UseAccurateNormals: 1=八面体解码（OctQuadEncode），0=简单 xyz*2-1
+// 由 C# 端 cmd.SetRayTracingIntParam 设置
+
+// ─── SRP Core 基础库 ────────────────────────────────────────────────
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Sampling/Sampling.hlsl"
+
+// ─── 项目公共头文件 ─────────────────────────────────────────────────
+#include "SSGICommon.hlsl"
+#include "SSGITypes.hlsl"
+
+// ─── RTAS 加速结构 ──────────────────────────────────────────────────
+RaytracingAccelerationStructure _RaytracingAccelerationStructureName;
+
+// ─── 光线追踪参数（由 C# 端 cmd.SetRayTracingXxxParam 设置） ────────
+float  _RaytracingRayMaxLength;
+int    _RaytracingNumSamples;
+int    _RaytracingMaxRecursion;
+float  _RaytracingIntensityClamp;
+int    _RayTracingLodBias;
+int    _RayTracingRayMissFallbackHierarchy;  // 保留声明（C# 端仍绑定，供 CHS 多 bounce 使用）
+int    _RayTracingLastBounceFallbackHierarchy;
+float  _RayTracingAmbientProbeDimmer;
+
+int    _RaytracingFrameIndex;
+
+// ─── 输入纹理 ───────────────────────────────────────────────────────
+Texture2D<float>  _CameraDepthTexture;
+// _CameraNormalsTexture 已在 SSGICommon.hlsl 中声明
+// _OwenScrambledTexture, _ScramblingTileXSPP, _RankingTileXSPP 已在 SSGICommon.hlsl 中声明
+
+// ─── 天空盒 Cubemap（miss shader 回退采样） ─────────────────────────
+TextureCube<float4> _SkyTexture;
+SamplerState sampler_SkyTexture;
+
+// ─── 混合模式命中掩码（可选，仅 Mixed 模式下绑定） ──────────────────
+Texture2D<float> _RTGIHitValidityMask;
+
+// ─── 混合模式 SSGI 结果输入（仅 Mixed 模式下绑定，读取 SSGI 命中像素的 GI 结果） ──
+Texture2D<float4> _IndirectDiffuseTexture;
+
+// ─── 混合模式标志（C# 端设置：1=Mixed, 0=RayTraced） ────────────────
+int _RTGIMixedMode;
+
+// ─── DDGI 采样资源（MixedDDGI 模式下由 C# 端绑定） ──────────────────
+Texture2D<float4> _DDGIIrradianceAtlas;
+Texture2D<float2> _DDGIDistanceAtlas;
+SamplerState sampler_DDGIIrradianceAtlas;
+int    _RTGIMixedDDGIMode;  // 1=MixedDDGI, 0=标准模式
+float3 _DDGIVolumeOrigin;
+float3 _DDGIVolumeSpacing;
+int3   _DDGIVolumeProbeCounts;
+float  _DDGINormalBias;
+float  _DDGIViewBias;
+float  _DDGIIrradianceGamma;
+int    _DDGIIrradianceProbeRes;
+int    _DDGIDistanceProbeRes;
+int    _DDGIProbesPerRow;
+float2 _DDGIIrradianceTexelSize;
+float2 _DDGIDistanceTexelSize;
+
+#include "Assets/DDGILightProbe/Runtime/Shaders/DDGISampling.hlsl"
+
+// ─── 调试法线模式（C# 端设置：1=输出 CHS 命中点法线, 0=正常光照） ──
+int _RTGIDebugNormalMode;
+
+// ─── 调试 Shadowmap 模式（C# 端设置：1=输出 CHS shadowmap 采样 UV, 0=正常光照） ──
+int _RTGIDebugShadowMode;
+
+// ─── AccurateNormals 运行时参数（DXR 不支持关键字，用整数参数替代） ──
+int _UseAccurateNormals;
+
+// ─── 半分辨率缩放参数（C# 端设置） ──────────────────────────────
+// _RTGIRayTracingScale: 全分辨率=1, 半分辨率=2
+// RayGen 中 fullPixelCoord = pixelCoord * _RTGIRayTracingScale 用于采样全分辨率深度/法线
+// ─── 无 Jitter InvVP 矩阵（TAA 兼容，由 C# 端显式绑定） ──────────
+// URP TAA 开启时 UNITY_MATRIX_I_VP 包含 jitter，导致世界坐标帧间抖动。
+// 使用 C# 端计算的 unjittered InvVP 替代，消除 TAA jitter 对光线起点的影响。
+float4x4 _RTGIInvVPNoJitter;
+
+int _RTGIRayTracingScale;
+
+// ─── 距离自适应射线偏移参数（由 C# 端 cmd.SetRayTracingFloatParam 设置） ──
+// 参考 HDRP EvaluateRayTracingBias：基于到相机距离在 nearBias 和 farBias 之间插值
+// URP 无 Camera Relative Rendering，默认值比 HDRP 大一个数量级
+float _RayTracingRayBias;        // 近处偏移（默认 0.01）
+float _RayTracingDistantRayBias; // 远处偏移（默认 0.1）
+
+// _RTGIFullScreenSize: float4(fullW, fullH, 1/fullW, 1/fullH)
+// 半分辨率时 ReconstructWorldPosition 需要全分辨率 rcpDimensions
+float4 _RTGIFullScreenSize;
+
+// ─── 输出纹理 ───────────────────────────────────────────────────────
+RWTexture2D<float4> _RTGIOutputTexture;
+
+// ─── Mixed 模式 GBuffer UAV 输出（供 RayGen 写入 SSGI GBuffer RT） ──────
+RWTexture2D<float4> _SSGIGBuffer0RW;        // albedo.rgb + materialFlags.a
+RWTexture2D<float4> _SSGIGBuffer2RW;        // normal.xyz + smoothness.a
+RWTexture2D<float4> _SSGIHitPositionNDCRW;  // xy=NDC, z=depth, w=validity
+
+// ─── RTAO 输出纹理（R8_UNorm，工作分辨率） ─────────────────────────
+RWTexture2D<float> _RTAOOutputTexture;
+// RTAO 参数（C# 端 cmd.SetRayTracingXxxParam 设置）
+float _RTAORadius;
+int   _EnableRTAO;
+
+// ─── RayPayload 结构体 ─────────────────────────────────────────────
+// 光线负载：传递颜色、命中距离和剩余弹射次数
+struct RayPayload
+{
+    float3 color;
+    float  hitT;
+    int    remainingBounces;  // 剩余弹射次数（递减至 0 停止递归）
+    // ─── Mixed 模式 GBuffer 输出（供 RayGen 写入 SSGI GBuffer RT） ──
+    float3 albedo;            // 命中点 albedo（_BaseMap × _Albedo）
+    float3 normalWS;          // 命中点世界空间法线（含法线贴图扰动）
+    float  smoothness;        // 命中点 smoothness
+};
+
+// ─── Frisvad (2012) 正交基构建 ─────────────────────────────────────
+// 从法线 N 构建 TBN 正交基，用于将局部半球方向变换到世界空间
+// 参考: Frisvad, "Building an Orthonormal Basis from a 3D Unit Vector Without Normalization", 2012
+// 公式:
+//   sz = sign(N.z)  （N.z >= 0 ? 1 : -1）
+//   a = 1 / (sz + N.z)
+//   b = N.x × N.y × a
+//   T = (N.x² × a × sz - 1, sz × b, N.x)
+//   B = (b, N.y² × a - sz, N.y)
+void GetLocalFrame(float3 N, out float3 T, out float3 B)
+{
+    float sz = (N.z >= 0.0) ? 1.0 : -1.0;
+    float a  = rcp(sz + N.z);
+    float ya = N.y * a;
+    float b  = N.x * ya;
+    float c  = N.x * N.x * a;
+    T = float3(c * sz - 1.0, sz * b, N.x);
+    B = float3(b, ya * N.y - sz, N.y);
+}
+
+// ─── HSV 辐照度钳制 ────────────────────────────────────────────────
+// 将 RGB 颜色的 HSV V 通道钳制到 clampValue，防止萤火虫噪点
+// 公式:
+//   V = max(R, G, B)
+//   if V > clampValue: scale = clampValue × rcp(V); color *= scale
+// 使用 RgbToHsv / HsvToRgb（SRP Core Color.hlsl 内建函数）
+float3 RTGIHSVClamp(float3 color, float clampValue)
+{
+    float3 hsv = RgbToHsv(color);
+    // saturate 等价于 clamp(x, 0, 1)，此处需要 clamp 到 [0, clampValue]
+    // 使用 min 替代 clamp：hsv.z 已 >= 0（来自 RgbToHsv），只需限制上界
+    hsv.z = min(hsv.z, clampValue);
+    return HsvToRgb(hsv);
+}
+
+// ─── 深度重建世界空间位置 ──────────────────────────────────────────
+// 从深度缓冲和像素坐标重建世界空间位置
+// 使用 _RTGIInvVPNoJitter（无 jitter InvVP，由 C# 端显式绑定）
+float3 ReconstructWorldPosition(uint2 pixelCoord, float2 rcpDimensions, float depth)
+{
+    // 像素中心 → NDC [0,1] → Clip [-1,1]
+    // MAD 形式：ndc = (pixelCoord + 0.5) * rcpDimensions * 2.0 - 1.0
+    float2 ndc = (pixelCoord + 0.5) * rcpDimensions;
+    float2 clipXY = ndc * 2.0 - 1.0;
+
+    // DX 平台 Y 轴翻转
+    #if UNITY_UV_STARTS_AT_TOP
+    clipXY.y = -clipXY.y;
+    #endif
+
+    float4 clipPos = float4(clipXY, depth, 1.0);
+    // 使用无 jitter 的 InvVP 矩阵重建世界坐标（TAA 兼容）
+    // URP TAA 开启时 UNITY_MATRIX_I_VP 包含帧间 jitter，导致重建坐标抖动 → 自相交 → 黑斑
+    // unjittered InvVP 与 jittered 深度的微小误差远小于法线偏移量，不影响光线发射
+    float4 worldPos = mul(_RTGIInvVPNoJitter, clipPos);
+    return worldPos.xyz * rcp(worldPos.w);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Miss Shader
+// ═══════════════════════════════════════════════════════════════════
+// Path tracing 语义：光线未命中任何几何体 = 击中天空
+// 沿光线方向采样天空盒 Cubemap，直接返回天空颜色。
+// miss = 击中天空，天空颜色就是该方向的辐照度，不需要任何衰减。
+
+[shader("miss")]
+void IndirectDiffuseMiss(inout RayPayload payload : SV_RayPayload)
+{
+    float3 rayOrigin = WorldRayOrigin();
+    float3 rayDir    = WorldRayDirection();
+
+    // MixedDDGI 模式：尝试采样 DDGI irradiance
+    // _RTGIMixedDDGIMode 为 uniform 参数（所有线程同值），无 warp divergence
+    if (_RTGIMixedDDGIMode)
+    {
+        // 构建 DDGIVolumeParams
+        DDGIVolumeParams vol;
+        vol.origin              = _DDGIVolumeOrigin;
+        vol.probeSpacing        = _DDGIVolumeSpacing;
+        vol.probeCounts         = _DDGIVolumeProbeCounts;
+        vol.normalBias          = _DDGINormalBias;
+        vol.viewBias            = _DDGIViewBias;
+        vol.irradianceGamma     = _DDGIIrradianceGamma;
+        vol.irradianceProbeRes  = _DDGIIrradianceProbeRes;
+        vol.distanceProbeRes    = _DDGIDistanceProbeRes;
+        vol.probesPerRow        = _DDGIProbesPerRow;
+        vol.irradianceTexelSize = _DDGIIrradianceTexelSize;
+        vol.distanceTexelSize   = _DDGIDistanceTexelSize;
+
+        // 检查光线起点是否在 DDGI Volume 内
+        float blendWeight = DDGIGetVolumeBlendWeight(rayOrigin, vol);
+        if (blendWeight > 0.0)
+        {
+            float3 surfaceBias = DDGIGetSurfaceBias(rayDir, -rayDir, vol);
+            float3 irradiance = DDGIGetVolumeIrradiance(
+                rayOrigin, surfaceBias, rayDir, vol,
+                _DDGIIrradianceAtlas, _DDGIDistanceAtlas,
+                sampler_DDGIIrradianceAtlas);
+
+            // 混合权重：Volume 边缘平滑过渡到天空盒
+            float3 skyColor = _SkyTexture.SampleLevel(sampler_SkyTexture, rayDir, 0.0).xyz;
+            payload.color = lerp(skyColor, irradiance, blendWeight);
+            payload.hitT = _RaytracingRayMaxLength;
+            return;
+        }
+    }
+
+    // 回退：标准天空盒采样
+    payload.color = _SkyTexture.SampleLevel(sampler_SkyTexture, rayDir, 0.0).xyz;
+    payload.hitT = _RaytracingRayMaxLength;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Ray Generation Shader
+// ═══════════════════════════════════════════════════════════════════
+// 核心流程：
+//   1. 深度重建世界空间位置
+//   2. 法线解码
+//   3. BND 序列采样（帧间偏移）
+//   4. 余弦加权半球采样 → TraceRay → 辐照度累积
+//   5. 求平均 → HSV 钳制 → 写入输出纹理
+//
+// 余弦加权半球采样公式：
+//   r = sqrt(u1)
+//   phi = 2π × u2
+//   localDir = (r × cos(phi), r × sin(phi), sqrt(1 - u1))
+//   D = T × localDir.x + B × localDir.y + N × localDir.z
+// 其中 TBN 由 Frisvad (2012) 正交基构建
+
+[shader("raygeneration")]
+void IndirectDiffuseRayGen()
+{
+    uint3 launchIndex = DispatchRaysIndex();
+    uint3 launchDim   = DispatchRaysDimensions();
+    uint2 pixelCoord  = launchIndex.xy;
+
+    // ─── 半分辨率坐标映射 ──────────────────────────────────────
+    // 半分辨率时 pixelCoord 是工作分辨率坐标（0..traceW-1, 0..traceH-1）
+    // 全分辨率深度/法线纹理需要用 fullPixelCoord 采样
+    // _RTGIRayTracingScale: 全分辨率=1, 半分辨率=2
+    uint2 fullPixelCoord = pixelCoord * (uint)_RTGIRayTracingScale;
+
+    // ─── 1. 深度读取与背景像素提前退出 ──────────────────────────
+    float depth = _CameraDepthTexture[fullPixelCoord];
+
+    // 背景像素（远裁剪面）：直接写零并退出，避免无意义的昂贵计算
+    // UNITY_RAW_FAR_CLIP_VALUE: DX=0, OpenGL=1
+    #if UNITY_REVERSED_Z
+    bool isBackground = depth <= 0.0;
+    #else
+    bool isBackground = depth >= 1.0;
+    #endif
+    if (isBackground)
+    {
+        // Mixed 模式：清零 GBuffer RT（确保 DeferredLighting 跳过背景像素）
+        if (_RTGIMixedMode)
+        {
+            _SSGIGBuffer0RW[pixelCoord] = 0;
+            _SSGIGBuffer2RW[pixelCoord] = 0;
+            _SSGIHitPositionNDCRW[pixelCoord] = 0;
+        }
+        _RTGIOutputTexture[pixelCoord] = 0;
+        // RTAO 背景像素写 1.0（无遮蔽）
+        if (_EnableRTAO)
+            _RTAOOutputTexture[pixelCoord] = 1.0;
+        return;
+    }
+
+    // ─── 1b. 混合模式：记录 SSGI 命中状态 ────────────────────────
+    // mask=1 表示 SSGI 已命中，GI 由 SSGI 提供，跳过 RTGI 射线（GI 互补关系不变）
+    // 但 RTAO 是独立的遮蔽信息，所有非背景像素都需要发射 RTAO 射线
+    // ssgiHit 为 uniform 分支（同一 warp 内所有像素走同一路径），无 warp divergence
+    bool ssgiHit = false;
+    if (_RTGIMixedMode)
+    {
+        float mask = _RTGIHitValidityMask[fullPixelCoord];
+        ssgiHit = mask > 0.5;
+        if (ssgiHit)
+        {
+            // SSGI 已命中，GBuffer 已由 SSGI Reproject Deferred 写入
+            // 清零 GBuffer UAV（确保 DeferredLighting 正确跳过）
+            _SSGIGBuffer0RW[pixelCoord] = 0;
+            _SSGIGBuffer2RW[pixelCoord] = 0;
+            _SSGIHitPositionNDCRW[pixelCoord] = 0;
+        }
+    }
+
+    // ─── 2. 重建世界空间位置 ────────────────────────────────────
+    // 半分辨率时使用全分辨率坐标和全分辨率 rcpDimensions 重建正确的世界空间位置
+    // _RTGIFullScreenSize.zw = (1/fullW, 1/fullH)
+    float2 rcpDim = _RTGIFullScreenSize.zw;
+    float3 positionWS = ReconstructWorldPosition(fullPixelCoord, rcpDim, depth);
+
+    // ─── 3. 解码世界空间法线 ────────────────────────────────────
+    // DXR RayTracingShader 不支持关键字（GlobalKeyword/LocalKeyword 均无效），
+    // 使用整数参数 _UseAccurateNormals 在运行时选择解码路径。
+    // 此处为 uniform 分支（所有像素走同一路径），无 warp divergence。
+    // _UseAccurateNormals=1: 八面体解码（URP Accurate G-Buffer Normals 开启时）
+    // _UseAccurateNormals=0: 简单 xyz*2-1 解码
+    float3 normalWS;
+    if (_UseAccurateNormals)
+    {
+        float3 packed = _CameraNormalsTexture[fullPixelCoord].xyz;
+        half2 remappedOctNormalWS = half2(Unpack888ToFloat2(packed));
+        half2 octNormalWS = remappedOctNormalWS * half(2.0) - half(1.0);
+        normalWS = half3(UnpackNormalOctQuadEncode(octNormalWS));
+    }
+    else
+    {
+        normalWS = _CameraNormalsTexture[fullPixelCoord].xyz * 2.0 - 1.0;
+    }
+
+    // ─── 4. 构建 TBN 正交基（循环外预计算） ────────────────────
+    float3 tangent, bitangent;
+    GetLocalFrame(normalWS, tangent, bitangent);
+
+    // ─── 距离自适应法线偏移（避免自相交） ────────────────────
+    // 参考 HDRP EvaluateRayTracingBias（RaytracingHelpers.hlsl）：
+    //   bias = lerp(nearBias, farBias, saturate((dist - near) / (far - near)))
+    // URP 无 Camera Relative Rendering，世界空间绝对坐标在远处浮点精度差，
+    // 需要更大的偏移量防止薄物体自相交产生黑斑。
+    // _WorldSpaceCameraPos 由 Unity 自动绑定到 RayTracing Shader。
+    // _ProjectionParams: x=±1, y=near, z=far, w=1/far（Unity 内建）
+    float distToCamera = length(positionWS - _WorldSpaceCameraPos.xyz);
+    float biasBlend = saturate((distToCamera - _ProjectionParams.y) * rcp(_ProjectionParams.z - _ProjectionParams.y));
+    float rayBias = lerp(_RayTracingRayBias, _RayTracingDistantRayBias, biasBlend);
+    float3 rayOrigin = positionWS + normalWS * rayBias;
+
+    // ─── 调试法线模式：提前退出，避免无意义的 TraceRay ──────────
+    // 输出当前像素表面法线（从 _CameraNormalsTexture 解码），
+    // 与 SSGI WorldNormal 调试模式对比同一表面法线
+    // 直接输出 normalWS [-1,1]，与 SSGI WorldNormal（Mode 4）编码一致
+    if (_RTGIDebugNormalMode)
+    {
+        if (_RTGIMixedMode)
+        {
+            _SSGIGBuffer0RW[pixelCoord] = 0;
+            _SSGIGBuffer2RW[pixelCoord] = 0;
+            _SSGIHitPositionNDCRW[pixelCoord] = 0;
+        }
+        _RTGIOutputTexture[pixelCoord] = float4(normalWS, 1.0);
+        if (_EnableRTAO)
+            _RTAOOutputTexture[pixelCoord] = 1.0;
+        return;
+    }
+
+    // ─── 调试 Shadowmap 模式：CHS 将 shadow coord 编码到 payload.color ──
+    // R=sc.x（atlas UV x），G=sc.y（atlas UV y），B=cascadeIdx×0.25
+    // 正常模式下 CHS 输出 lit 颜色，debug 模式下 CHS 输出 shadow coord
+    // RayGen 直接透传 CHS 的 payload.color 到输出纹理
+    if (_RTGIDebugShadowMode)
+    {
+        // 只发射一条光线（debug 不需要多采样）
+        float3 sampleDir;
+        {
+            float u1 = GetBNDSequenceSample(pixelCoord, _RaytracingFrameIndex, 0);
+            float u2 = GetBNDSequenceSample(pixelCoord, _RaytracingFrameIndex, 1);
+            float r = sqrt(u1);
+            float phi = TWO_PI * u2;
+            float sinPhi, cosPhi;
+            sincos(phi, sinPhi, cosPhi);
+            sampleDir = tangent * (r * cosPhi) + bitangent * (r * sinPhi) + normalWS * sqrt(1.0 - u1);
+        }
+
+        RayDesc debugRay;
+        debugRay.Origin    = rayOrigin;
+        debugRay.Direction = sampleDir;
+        debugRay.TMin      = 0.0;
+        debugRay.TMax      = _RaytracingRayMaxLength;
+
+        RayPayload debugPayload;
+        debugPayload.color = 0.0;
+        debugPayload.hitT  = -1.0;
+        debugPayload.remainingBounces = 0;
+        debugPayload.albedo = 0.0;
+        debugPayload.normalWS = 0.0;
+        debugPayload.smoothness = 0.0;
+
+        TraceRay(
+            _RaytracingAccelerationStructureName,
+            RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+            0xFF, 0, 1, 0,
+            debugRay,
+            debugPayload);
+
+        // CHS 在 _RTGIDebugShadowMode=1 时已将 shadow coord 编码到 payload.color
+        // miss 时 payload.color 保持 0（黑色 = 未命中）
+        if (_RTGIMixedMode)
+        {
+            _SSGIGBuffer0RW[pixelCoord] = 0;
+            _SSGIGBuffer2RW[pixelCoord] = 0;
+            _SSGIHitPositionNDCRW[pixelCoord] = 0;
+        }
+        _RTGIOutputTexture[pixelCoord] = float4(debugPayload.color, 1.0);
+        if (_EnableRTAO)
+            _RTAOOutputTexture[pixelCoord] = 1.0;
+        return;
+    }
+
+    // ─── 5. 采样循环：BND 序列 → 余弦半球 → TraceRay ──────────
+    float3 irradiance = 0.0;
+    float maxHitT = 0.0;  // 追踪最大命中距离（供 RTGIRayLength 调试模式使用）
+
+    // RTAO 累积变量（循环外预初始化）
+    // RTAO 公式: AO = (1/N) × Σ saturate(hitT × rcp(aoRadius))
+    // hitT 越小（遮挡物越近）→ AO 值越小 → 遮蔽越强
+    float aoAccum = 0.0;
+    float rcpAORadius = rcp(_RTAORadius);  // CPU 可预计算，但 DXR 不支持 SetRayTracingFloatParam 传 rcp 值，此处计算一次
+
+    // CPU 预计算的帧偏移基数（循环外计算，避免循环内重复乘法）
+    int frameBase = _RaytracingFrameIndex * _RaytracingNumSamples;
+
+    // 保存最后一条光线的 payload 和方向（供 Mixed 模式 GBuffer 输出使用）
+    float3 lastSampleDir = 0.0;
+    RayPayload lastPayload;
+    lastPayload.color = 0.0;
+    lastPayload.hitT = -1.0;
+    lastPayload.remainingBounces = 0;
+    lastPayload.albedo = 0.0;
+    lastPayload.normalWS = 0.0;
+    lastPayload.smoothness = 0.0;
+
+    for (int i = 0; i < _RaytracingNumSamples; ++i)
+    {
+        // 全局采样索引 = 帧偏移基数 + 当前样本索引
+        int globalSampleIndex = frameBase + i;
+
+        // BND 序列采样（Heitz et al. 低差异蓝噪声分布）
+        float u1 = GetBNDSequenceSample(pixelCoord, globalSampleIndex, 0);
+        float u2 = GetBNDSequenceSample(pixelCoord, globalSampleIndex, 1);
+
+        // 余弦加权半球采样（局部坐标系 → 世界坐标系）
+        // 公式: r = sqrt(u1), phi = 2π × u2
+        //   localDir = (r × cos(phi), r × sin(phi), sqrt(1 - u1))
+        //   D = T × localDir.x + B × localDir.y + N × localDir.z
+        float r = sqrt(u1);
+        float phi = TWO_PI * u2;
+        float sinPhi, cosPhi;
+        sincos(phi, sinPhi, cosPhi);
+        float localZ = sqrt(1.0 - u1);
+
+        // 世界空间方向（MAD 形式展开）
+        // D.x = T.x × (r × cosPhi) + B.x × (r × sinPhi) + N.x × localZ
+        float rCosPhi = r * cosPhi;
+        float rSinPhi = r * sinPhi;
+        float3 sampleDir = tangent * rCosPhi + bitangent * rSinPhi + normalWS * localZ;
+
+        // 构建光线描述符
+        RayDesc rayDesc;
+        rayDesc.Origin    = rayOrigin;
+        rayDesc.Direction = sampleDir;
+        rayDesc.TMin      = 0.0;
+        rayDesc.TMax      = _RaytracingRayMaxLength;
+
+        // 初始化光线负载
+        RayPayload payload;
+        payload.color = 0.0;
+        payload.hitT  = -1.0;
+        payload.remainingBounces = _RaytracingMaxRecursion - 1;  // 首次弹射由 RayGen 发射，CHS 中递归剩余次数
+        payload.albedo = 0.0;
+        payload.normalWS = 0.0;
+        payload.smoothness = 0.0;
+
+        // 发射光线（背面剔除，GI 标志）
+        TraceRay(
+            _RaytracingAccelerationStructureName,
+            RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+            0xFF,           // instanceMask: 所有实例
+            0,              // hitGroupIndex
+            1,              // hitGroupStride
+            0,              // missShaderIndex
+            rayDesc,
+            payload
+        );
+
+        // RTAO 累积：基于距离的遮蔽衰减（所有非背景像素，不受 ssgiHit 影响）
+        // 公式: aoAccum += saturate(hitT × rcp(aoRadius))
+        // hitT < aoRadius → 部分遮蔽, hitT >= aoRadius → 无遮蔽(1.0)
+        aoAccum += saturate(payload.hitT * rcpAORadius);
+
+        // RTGI 累积：仅非 SSGI 命中像素（GI 互补关系——SSGI 命中像素的 GI 由 SSGI 提供）
+        // ssgiHit 为 uniform 分支，无 warp divergence
+        if (!ssgiHit)
+        {
+            // HSV 辐照度钳制（逐光线钳制，防止单条光线的萤火虫噪点污染累积）
+            irradiance += RTGIHSVClamp(payload.color, _RaytracingIntensityClamp);
+
+            // 记录最大命中距离（供调试热力图使用）
+            maxHitT = max(maxHitT, payload.hitT);
+
+            lastSampleDir = sampleDir;
+            lastPayload = payload;
+        }
+    }
+
+    // ─── 6. 求平均并写入输出 ────────────────────────────────────
+    // rcp(sampleCount) 替代除法
+    float rcpSamples = rcp((float)_RaytracingNumSamples);
+    irradiance *= rcpSamples;
+
+    // .a 通道写入归一化最大光线命中距离（供 RTGIRayLength 调试热力图使用）
+    // 归一化公式: maxHitT * rcp(rayMaxLength)，范围 [0, 1]
+    float normalizedHitT = maxHitT * rcp(_RaytracingRayMaxLength);
+
+    // NaN 保护（CHS 光照计算可能产生 NaN，如法线退化、rcp(0) 等）
+    irradiance = IsNaN(irradiance.x) ? 0.0 : irradiance;
+
+    // Mixed 模式和非 Mixed 模式统一输出：CHS 已计算完整 lit 颜色（含 shadow ray fallback），
+    // 无需 compute shader 重新做 deferred lighting
+    // SSGI 命中像素不写入 _RTGIOutputTexture（GI 由 SSGI 提供），仅写入 RTAO 结果
+    // ssgiHit 为 uniform 分支，无 warp divergence
+    if (!ssgiHit)
+    {
+        // 非 SSGI 命中像素：正常输出 RTGI + GBuffer 清零
+        // GBuffer UAV 在 Mixed 模式下仍需写入（DXR 要求所有绑定的 UAV 都有写入路径），
+        // 但不再被后续 pass 读取
+        if (_RTGIMixedMode)
+        {
+            _SSGIGBuffer0RW[pixelCoord] = 0;
+            _SSGIGBuffer2RW[pixelCoord] = 0;
+            _SSGIHitPositionNDCRW[pixelCoord] = 0;
+        }
+        _RTGIOutputTexture[pixelCoord] = float4(irradiance, normalizedHitT);
+    }
+
+    // RTAO 输出：AO = aoAccum × rcp(sampleCount)
+    // uniform 分支（所有像素走同一路径），无 warp divergence
+    if (_EnableRTAO)
+        _RTAOOutputTexture[pixelCoord] = aoAccum * rcpSamples;
+}

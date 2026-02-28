@@ -1,0 +1,169 @@
+#pragma kernel CSProbeRelocation
+#pragma kernel CSProbeRelocationReset
+
+#include "DDGIRaytracing/DDGIGBuffer.hlsl"
+
+#define DDGI_PROBE_STATE_ACTIVE   0   // 活跃状态，正常更新和采样
+#define DDGI_PROBE_STATE_INACTIVE 1   // 非活跃状态，跳过更新和采样
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+
+RWTexture2D<float4> _ProbeData;
+
+int _ProbeCount;
+int _RaysPerProbe;
+int _FixedRayCount;
+int _GBufferWidth;
+int _ProbeDataWidth;
+float3 _ProbeSpacing;
+float _MinFrontfaceDistance;
+float _BackfaceThreshold;
+
+uint2 GetProbeDataCoord(uint probeIndex)
+{
+    return uint2(probeIndex % _ProbeDataWidth, probeIndex / _ProbeDataWidth);
+}
+
+uint2 GetGBufferCoord(uint probeIndex, uint rayIndex)
+{
+    uint linearIndex = probeIndex * _RaysPerProbe + rayIndex;
+    return uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+}
+
+float3 GetFixedRayDirection(uint rayIndex)
+{
+    float3 dir = FibonacciSphereDirection(rayIndex, _FixedRayCount);
+    return normalize(dir);
+}
+
+[numthreads(32, 1, 1)]
+void CSProbeRelocation(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchID.x;
+    if (probeIndex >= (uint)_ProbeCount)
+        return;
+
+    uint2 probeDataCoord = GetProbeDataCoord(probeIndex);
+    float4 probeData = _ProbeData[probeDataCoord];
+    float3 currentOffset = probeData.xyz;
+
+    int closestBackfaceIndex = -1;
+    int closestFrontfaceIndex = -1;
+    int farthestFrontfaceIndex = -1;
+    float closestBackfaceDistance = 1e27;
+    float closestFrontfaceDistance = 1e27;
+    float farthestFrontfaceDistance = 0.0;
+    float backfaceCount = 0.0;
+
+    int numRays = min(_RaysPerProbe, _FixedRayCount);
+    bool hitMiss = false;
+
+    for (int rayIdx = 0; rayIdx < numRays; rayIdx++)
+    {
+
+        uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIdx);
+        float4 positionDistance = _GBuffer_PositionDistance[gBufferCoord];
+        float4 normalHitFlag = _GBuffer_NormalHitFlag[gBufferCoord];
+
+        float hitDistance = positionDistance.w;
+        uint hitFlag = (uint)normalHitFlag.w;
+
+        if (hitFlag == 2 || hitDistance < 0)
+        {
+            backfaceCount += 1.0;
+
+            float actualDistance = hitDistance < 0 ? -hitDistance * 5.0 : hitDistance;
+
+            if (actualDistance < closestBackfaceDistance)
+            {
+                closestBackfaceDistance = actualDistance;
+                closestBackfaceIndex = rayIdx;
+            }
+        }
+        else if (hitFlag == 1)
+        {
+            if (hitDistance < closestFrontfaceDistance)
+            {
+                closestFrontfaceDistance = hitDistance;
+                closestFrontfaceIndex = rayIdx;
+            }
+
+            else if (hitDistance > farthestFrontfaceDistance)
+            {
+                farthestFrontfaceDistance = hitDistance;
+                farthestFrontfaceIndex = rayIdx;
+            }
+        }
+        else if(hitFlag == 0)
+        {
+            hitMiss = true;
+        }
+
+    }
+
+    float3 fullOffset = float3(1e27, 1e27, 1e27);
+
+    if (closestBackfaceIndex != -1 &&
+        (backfaceCount / numRays) > _BackfaceThreshold)
+    {
+
+        float3 backfaceDir = GetFixedRayDirection(closestBackfaceIndex);
+        fullOffset = currentOffset + backfaceDir *
+                     (closestBackfaceDistance + _MinFrontfaceDistance * 0.5);
+    }
+
+    else if (closestFrontfaceDistance < _MinFrontfaceDistance)
+    {
+
+        float3 closestDir = GetFixedRayDirection(closestFrontfaceIndex);
+        float3 farthestDir = GetFixedRayDirection(farthestFrontfaceIndex);
+
+        if(hitMiss)
+        {
+            farthestDir = -closestDir;
+        }
+
+        if (dot(closestDir, farthestDir) <= 0.0)
+        {
+
+            float maxMoveDistance = min(min(_ProbeSpacing.x, _ProbeSpacing.y), _ProbeSpacing.z) * 0.01f;
+            farthestDir *= min(farthestFrontfaceDistance, maxMoveDistance);
+            fullOffset = currentOffset + farthestDir;
+        }
+    }
+
+    else if (closestFrontfaceDistance > _MinFrontfaceDistance)
+    {
+        float offsetLength = length(currentOffset);
+        if (offsetLength > 0.001)
+        {
+
+            float moveBackMargin = min(closestFrontfaceDistance - _MinFrontfaceDistance,
+                                       offsetLength) * 0.2f;
+            float3 moveBackDir = -currentOffset / offsetLength;
+            fullOffset = currentOffset + moveBackMargin * moveBackDir;
+        }
+    }
+
+    float3 normalizedOffset = fullOffset / _ProbeSpacing;
+    if (dot(normalizedOffset, normalizedOffset) < 0.2025)
+    {
+        currentOffset = fullOffset;
+    }
+
+    _ProbeData[probeDataCoord] = float4(currentOffset, probeData.w);
+
+}
+
+[numthreads(32, 1, 1)]
+void CSProbeRelocationReset(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchID.x;
+    if (probeIndex >= (uint)_ProbeCount)
+        return;
+
+    uint2 probeDataCoord = GetProbeDataCoord(probeIndex);
+
+    _ProbeData[probeDataCoord] = float4(0, 0, 0, DDGI_PROBE_STATE_ACTIVE);
+}

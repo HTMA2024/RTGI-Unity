@@ -1,0 +1,45 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel KDepthDownsample
+#pragma kernel KDepthCopyMip0
+
+RWTexture2D<float> _DepthMipChain;
+
+CBUFFER_START(cb)
+    uint4 _SrcOffsetAndLimit;
+    uint4 _DstOffset;
+CBUFFER_END
+
+Texture2D<float> _DepthPyramidSourceDepth;
+
+[numthreads(8, 8, 1)]
+void KDepthDownsample(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 srcOffset = _SrcOffsetAndLimit.xy;
+    uint2 srcLimit  = _SrcOffsetAndLimit.zw;
+    uint2 dstOffset = _DstOffset.xy;
+
+    uint2 srcPixelUL = srcOffset + (dispatchThreadId.xy << 1);
+
+    float d00 = _DepthMipChain[min(srcPixelUL,                  srcLimit)];
+    float d10 = _DepthMipChain[min(srcPixelUL + uint2(1u, 0u),  srcLimit)];
+    float d01 = _DepthMipChain[min(srcPixelUL + uint2(0u, 1u),  srcLimit)];
+    float d11 = _DepthMipChain[min(srcPixelUL + uint2(1u, 1u),  srcLimit)];
+
+#if UNITY_REVERSED_Z
+    float minDepth = max(max(d00, d10), max(d01, d11));
+#else
+    float minDepth = min(min(d00, d10), min(d01, d11));
+#endif
+
+    _DepthMipChain[dstOffset + dispatchThreadId.xy] = minDepth;
+}
+
+[numthreads(8, 8, 1)]
+void KDepthCopyMip0(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    _DepthMipChain[coord] = _DepthPyramidSourceDepth[coord];
+}

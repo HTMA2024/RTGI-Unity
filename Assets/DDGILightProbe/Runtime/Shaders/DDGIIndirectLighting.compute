@@ -1,0 +1,89 @@
+#pragma kernel CSIndirectLighting
+
+#include "DDGISampling.hlsl"
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+
+Texture2D<float4> _IrradianceAtlas_Prev;
+Texture2D<float2> _DistanceAtlas_Prev;
+
+Texture2D<float4> _ProbeData;
+int _ProbeDataWidth;
+
+RWTexture2D<float4> _IndirectIrradianceBuffer;
+
+float4 _VolumeOrigin;
+float4 _VolumeSpacing;
+int4 _VolumeProbeCounts;
+
+float4 _IrradianceAtlasParams;
+float4 _DistanceAtlasParams;
+
+float _NormalBias;
+float _ViewBias;
+float _ChebyshevBias;
+float _IrradianceGamma;
+
+uint _GBufferWidth;
+uint _GBufferHeight;
+
+DDGIVolumeParams BuildVolumeParams()
+{
+    DDGIVolumeParams params;
+    params.origin = _VolumeOrigin.xyz;
+    params.probeSpacing = _VolumeSpacing.xyz;
+    params.probeCounts = _VolumeProbeCounts.xyz;
+    params.normalBias = _NormalBias;
+    params.viewBias = _ViewBias;
+    params.irradianceGamma = _IrradianceGamma;
+    params.irradianceProbeRes = (int)_IrradianceAtlasParams.z;
+    params.distanceProbeRes = (int)_DistanceAtlasParams.z;
+    params.probesPerRow = (int)_IrradianceAtlasParams.w;
+    params.irradianceTexelSize = _IrradianceAtlasParams.xy;
+    params.distanceTexelSize = _DistanceAtlasParams.xy;
+    return params;
+}
+
+[numthreads(64, 1, 1)]
+void CSIndirectLighting(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint linearIndex = dispatchID.x;
+
+    uint2 texCoord = uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+
+    if (texCoord.x >= _GBufferWidth || texCoord.y >= _GBufferHeight)
+        return;
+
+    float4 positionDistance = _GBuffer_PositionDistance[texCoord];
+    float4 normalHitFlag = _GBuffer_NormalHitFlag[texCoord];
+
+    float3 hitPosition = positionDistance.xyz;
+    float hitDistance = positionDistance.w;
+    float3 hitNormal = normalize(normalHitFlag.xyz);
+
+    float hitFlag = normalHitFlag.w;
+
+    if (hitFlag < 0.5 || hitDistance < 0.0)
+    {
+        _IndirectIrradianceBuffer[texCoord] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    DDGIVolumeParams volume = BuildVolumeParams();
+
+    float3 surfaceBias = DDGIGetSurfaceBias(hitNormal, hitNormal, volume);
+
+    float3 irradiance = DDGIGetVolumeIrradianceWithProbeState(
+        hitPosition,
+        surfaceBias,
+        hitNormal,
+        volume,
+        _IrradianceAtlas_Prev,
+        _DistanceAtlas_Prev,
+        _ProbeData,
+        _ProbeDataWidth
+    );
+
+    _IndirectIrradianceBuffer[texCoord] = float4(irradiance, 1.0);
+}

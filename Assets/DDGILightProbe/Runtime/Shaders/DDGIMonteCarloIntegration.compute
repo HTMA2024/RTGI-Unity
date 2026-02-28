@@ -1,0 +1,721 @@
+#pragma kernel CSMonteCarloIntegration
+#pragma kernel CSMonteCarloIrradiance
+#pragma kernel CSMonteCarloDistance
+#pragma kernel CSUpdateBorderRT
+#pragma kernel CSUpdateBorderIrradiance
+#pragma kernel CSUpdateBorderDistance
+
+#define PI 3.14159265359
+#define INV_PI  0.3183098862
+#define TWO_PI 6.28318530718
+#define GOLDEN_RATIO 1.61803398875
+
+#define DDGI_PROBE_STATE_ACTIVE   0   // 活跃状态，正常更新和采样
+#define DDGI_PROBE_STATE_INACTIVE 1   // 非活跃状态，跳过更新和采样
+
+Texture2D<float4> _RadianceBuffer;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+Texture2D<float4> _ProbeData;
+
+Texture2D<float4> _IrradianceAtlas_Prev;
+Texture2D<float2> _DistanceAtlas_Prev;
+
+RWTexture2D<float4> _IrradianceAtlas;
+RWTexture2D<float2> _DistanceAtlas;
+RWTexture2D<float> _ProbeVariability;
+
+uint _GBufferWidth;
+uint _GBufferHeight;
+uint _RaysPerProbe;
+uint _FixedRayCount;
+uint _ProbeCount;
+uint _ProbeDataWidth;
+
+int4 _IrradianceAtlasSize;
+int4 _DistanceAtlasSize;
+int _GutterSize;
+
+float _Hysteresis;
+float _IrradianceGamma;
+float _MaxRayDistance;
+float _IrradianceThreshold;
+float _BrightnessThreshold;
+int _VariabilityEnabled;
+float _BackfaceThreshold;
+
+float4x4 _RayRotationMatrix;
+
+float2 OctahedronEncode(float3 n)
+{
+    float sum = abs(n.x) + abs(n.y) + abs(n.z);
+    n.xy /= sum;
+
+    if (n.z < 0.0)
+    {
+        float2 signNotZero = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * signNotZero;
+    }
+
+    return n.xy * 0.5 + 0.5;
+}
+
+float3 OctahedronDecode(float2 uv)
+{
+    uv = uv * 2.0 - 1.0;
+
+    float3 n = float3(uv.x, uv.y, 1.0 - abs(uv.x) - abs(uv.y));
+
+    if (n.z < 0.0)
+    {
+        float2 signNotZero = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * signNotZero;
+    }
+
+    return normalize(n);
+}
+
+float3 FibonacciSphereDirection(uint rayIndex, uint totalRays)
+{
+    float goldenAngle = TWO_PI / (GOLDEN_RATIO * GOLDEN_RATIO);
+    float theta = goldenAngle * rayIndex;
+    float cosTheta = 1.0 - (2.0 * rayIndex + 1.0) / (float)totalRays;
+    float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
+
+    return float3(
+        cos(theta) * sinTheta,
+        sin(theta) * sinTheta,
+        cosTheta
+    );
+}
+
+float3 GetRayDirection(uint rayIndex)
+{
+
+    bool isFixedRay = (rayIndex < _FixedRayCount);
+
+    uint sampleIndex = isFixedRay ? rayIndex : (rayIndex - _FixedRayCount);
+    uint numRays = isFixedRay ? _FixedRayCount : (_RaysPerProbe - _FixedRayCount);
+
+    float3 dir = FibonacciSphereDirection(sampleIndex, numRays);
+
+    if (isFixedRay)
+        return normalize(dir);
+
+    dir = mul((float3x3)_RayRotationMatrix, dir);
+    return normalize(dir);
+}
+
+int2 GetProbePixelCoord(int probeIndex, int probeResolution, int probesPerRow, int gutterSize)
+{
+    int probeX = probeIndex % probesPerRow;
+    int probeY = probeIndex / probesPerRow;
+    int probeSizeWithGutter = probeResolution + gutterSize * 2;
+    return int2(
+        probeX * probeSizeWithGutter + gutterSize,
+        probeY * probeSizeWithGutter + gutterSize
+    );
+}
+
+uint2 GetGBufferCoord(uint probeIndex, uint rayIndex)
+{
+    uint linearIndex = probeIndex * _RaysPerProbe + rayIndex;
+    return uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+}
+
+uint2 GetProbeDataCoord(uint probeIndex)
+{
+    return uint2(probeIndex % _ProbeDataWidth, probeIndex / _ProbeDataWidth);
+}
+
+uint GetProbeState(uint probeIndex)
+{
+    uint2 coord = GetProbeDataCoord(probeIndex);
+    return (uint)_ProbeData[coord].w;
+}
+
+float RTXGIMaxComponent(float3 color)
+{
+    return max(max(color.r, color.g), color.b);
+}
+
+float RTXGILinearRGBToLuminance(float3 color)
+{
+    return dot(color, float3(0.2126, 0.7152, 0.0722));
+}
+
+[numthreads(8, 8, 1)]
+void CSMonteCarloIntegration(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchThreadId.z;
+    int2 localPixel = int2(dispatchThreadId.xy);
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    if (_ProbeDataWidth > 0)
+    {
+        uint probeState = GetProbeState(probeIndex);
+        if (probeState == DDGI_PROBE_STATE_INACTIVE)
+            return;
+    }
+
+    if (localPixel.x < _IrradianceAtlasSize.z && localPixel.y < _IrradianceAtlasSize.z)
+    {
+
+        float2 uv = (float2(localPixel) + 0.5) / float(_IrradianceAtlasSize.z);
+        float3 texelDirection = OctahedronDecode(uv);
+
+        float3 irradianceSum = float3(0, 0, 0);
+        float weightSum = 0.0;
+
+        uint backfaceCount = 0;
+        uint validRayCount = 0;
+
+        for (uint rayIndex = 0; rayIndex < _RaysPerProbe; rayIndex++)
+        {
+
+            float3 rayDir = GetRayDirection(rayIndex);
+
+            float cosWeight = dot(rayDir, texelDirection);
+
+            if (cosWeight <= 0.0)
+                continue;
+
+            uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIndex);
+            float4 radianceData = _RadianceBuffer[gBufferCoord];
+            float3 radiance = radianceData.rgb;
+            float hitDistance = radianceData.w;
+
+            if (hitDistance < 0.0)
+            {
+                backfaceCount++;
+                continue;
+            }
+
+            validRayCount++;
+
+            irradianceSum += radiance * cosWeight;
+            weightSum += cosWeight;
+        }
+
+        uint totalConsideredRays = backfaceCount + validRayCount;
+        float backfaceRatio = (totalConsideredRays > 0) ?
+            (float)backfaceCount / (float)totalConsideredRays : 0.0;
+
+        if (backfaceRatio > _BackfaceThreshold)
+        {
+
+            return;
+        }
+
+        float epsilon = _RaysPerProbe * 1e-9;
+        float3 newIrradiance = irradianceSum * rcp(2.0 * max(weightSum, epsilon));
+
+        int2 irradianceBaseCoord = GetProbePixelCoord(probeIndex, _IrradianceAtlasSize.z, _IrradianceAtlasSize.w, _GutterSize);
+        int2 irradiancePixel = irradianceBaseCoord + localPixel;
+
+        newIrradiance = pow(max(newIrradiance, 0.0), rcp(_IrradianceGamma));
+
+        float4 oldIrradianceData = _IrradianceAtlas_Prev[irradiancePixel];
+        float3 oldIrradiance = oldIrradianceData.rgb;
+
+        float hysteresis = _Hysteresis;
+
+        if (dot(oldIrradiance, oldIrradiance) == 0.0)
+            hysteresis = 0.0;
+
+        float3 delta = newIrradiance - oldIrradiance;
+
+        if (RTXGIMaxComponent(oldIrradiance - newIrradiance) > _IrradianceThreshold)
+        {
+            hysteresis = max(0.0, hysteresis - 0.75);
+        }
+
+        if (RTXGILinearRGBToLuminance(delta) > _BrightnessThreshold)
+        {
+            delta *= 0.25;
+        }
+
+        static const float c_threshold = 1.0 / 1024.0;
+        float3 lerpDelta = (1.0 - hysteresis) * delta;
+
+        if (RTXGIMaxComponent(newIrradiance) < RTXGIMaxComponent(oldIrradiance))
+        {
+            lerpDelta = min(max(c_threshold, abs(lerpDelta)), abs(delta)) * sign(lerpDelta);
+        }
+
+        float3 finalIrradiance = oldIrradiance + lerpDelta;
+
+        _IrradianceAtlas[irradiancePixel] = float4(finalIrradiance, 1.0);
+
+        if (_VariabilityEnabled)
+        {
+
+            float3 irradianceSigma2 = (newIrradiance - oldIrradiance) * (newIrradiance - finalIrradiance);
+
+            float luminanceSigma2 = RTXGILinearRGBToLuminance(irradianceSigma2);
+            float luminanceMean = RTXGILinearRGBToLuminance(finalIrradiance);
+
+            const float c_variabilityThreshold = 1.0 / 1024.0;
+            float coefficientOfVariation = (luminanceMean <= c_variabilityThreshold) ?
+                                            0.0 :
+                                            sqrt(abs(luminanceSigma2)) / luminanceMean;
+
+            _ProbeVariability[irradiancePixel] = coefficientOfVariation;
+        }
+    }
+
+    if (localPixel.x < _DistanceAtlasSize.z && localPixel.y < _DistanceAtlasSize.z)
+    {
+
+        float2 uv = (float2(localPixel) + 0.5) / float(_DistanceAtlasSize.z);
+        float3 texelDirection = OctahedronDecode(uv);
+
+        float distanceSum = 0.0;
+        float distanceSqSum = 0.0;
+        float weightSum = 0.0;
+
+        float probeMaxRayDistance = _MaxRayDistance;
+
+        for (uint rayIndex = 0; rayIndex < _RaysPerProbe; rayIndex++)
+        {
+            float3 rayDir = GetRayDirection(rayIndex);
+
+            float cosWeight = dot(rayDir, texelDirection);
+            if (cosWeight <= 0.0)
+                continue;
+
+            uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIndex);
+            float4 radianceData = _RadianceBuffer[gBufferCoord];
+            float hitDistance = radianceData.w;
+
+            hitDistance = min(abs(hitDistance), probeMaxRayDistance);
+            if (radianceData.w < 0)
+                hitDistance = probeMaxRayDistance;
+
+            distanceSum += hitDistance * cosWeight;
+            distanceSqSum += hitDistance * hitDistance * cosWeight;
+            weightSum += cosWeight;
+        }
+
+        float epsilon = _RaysPerProbe * 1e-9;
+        float2 newDistance = float2(
+            distanceSum * rcp(2.0 * max(weightSum, epsilon)),
+            distanceSqSum * rcp(2.0 * max(weightSum, epsilon))
+        );
+
+        int2 distanceBaseCoord = GetProbePixelCoord(probeIndex, _DistanceAtlasSize.z, _DistanceAtlasSize.w, _GutterSize);
+        int2 distancePixel = distanceBaseCoord + localPixel;
+
+        float2 oldDistance = _DistanceAtlas_Prev[distancePixel];
+
+        float hysteresis = _Hysteresis;
+
+        if (dot(oldDistance, oldDistance) == 0.0)
+            hysteresis = 0.0;
+
+        float2 finalDistance = lerp(newDistance, oldDistance, hysteresis);
+
+        _DistanceAtlas[distancePixel] = finalDistance;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSMonteCarloIrradiance(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchThreadId.z;
+    int2 localPixel = int2(dispatchThreadId.xy);
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    if (_ProbeDataWidth > 0)
+    {
+        uint probeState = GetProbeState(probeIndex);
+        if (probeState == DDGI_PROBE_STATE_INACTIVE)
+            return;
+    }
+
+    if (localPixel.x >= _IrradianceAtlasSize.z || localPixel.y >= _IrradianceAtlasSize.z)
+        return;
+
+    float2 uv = (float2(localPixel) + 0.5) / float(_IrradianceAtlasSize.z);
+    float3 texelDirection = OctahedronDecode(uv);
+
+    float3 irradianceSum = float3(0, 0, 0);
+    float weightSum = 0.0;
+
+    uint backfaceCount = 0;
+    uint validRayCount = 0;
+
+    for (uint rayIndex = 0; rayIndex < _RaysPerProbe; rayIndex++)
+    {
+        float3 rayDir = GetRayDirection(rayIndex);
+        float cosWeight = dot(rayDir, texelDirection);
+
+        if (cosWeight <= 0.0)
+            continue;
+
+        uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIndex);
+        float4 radianceData = _RadianceBuffer[gBufferCoord];
+        float3 radiance = radianceData.rgb;
+        float hitDistance = radianceData.w;
+
+        if (hitDistance < 0.0)
+        {
+            backfaceCount++;
+            continue;
+        }
+
+        validRayCount++;
+        irradianceSum += radiance * cosWeight;
+        weightSum += cosWeight;
+    }
+
+    uint totalConsideredRays = backfaceCount + validRayCount;
+    float backfaceRatio = (totalConsideredRays > 0) ?
+        (float)backfaceCount / (float)totalConsideredRays : 0.0;
+
+    if (backfaceRatio > _BackfaceThreshold)
+        return;
+
+    float epsilon = _RaysPerProbe * 1e-9;
+    float3 newIrradiance = irradianceSum * rcp(2.0 * max(weightSum, epsilon));
+
+    int2 irradianceBaseCoord = GetProbePixelCoord(probeIndex, _IrradianceAtlasSize.z, _IrradianceAtlasSize.w, _GutterSize);
+    int2 irradiancePixel = irradianceBaseCoord + localPixel;
+
+    newIrradiance = pow(max(newIrradiance, 0.0), rcp(_IrradianceGamma));
+
+    float4 oldIrradianceData = _IrradianceAtlas_Prev[irradiancePixel];
+    float3 oldIrradiance = oldIrradianceData.rgb;
+
+    float hysteresis = _Hysteresis;
+    if (dot(oldIrradiance, oldIrradiance) == 0.0)
+        hysteresis = 0.0;
+
+    float3 delta = newIrradiance - oldIrradiance;
+
+    if (RTXGIMaxComponent(oldIrradiance - newIrradiance) > _IrradianceThreshold)
+    {
+        hysteresis = max(0.0, hysteresis - 0.75);
+    }
+
+    if (RTXGILinearRGBToLuminance(delta) > _BrightnessThreshold)
+    {
+        delta *= 0.25;
+    }
+
+    static const float c_threshold = 1.0 / 1024.0;
+    float3 lerpDelta = (1.0 - hysteresis) * delta;
+
+    if (RTXGIMaxComponent(newIrradiance) < RTXGIMaxComponent(oldIrradiance))
+    {
+        lerpDelta = min(max(c_threshold, abs(lerpDelta)), abs(delta)) * sign(lerpDelta);
+    }
+
+    float3 finalIrradiance = oldIrradiance + lerpDelta;
+    _IrradianceAtlas[irradiancePixel] = float4(finalIrradiance, 1.0);
+
+    if (_VariabilityEnabled)
+    {
+        float3 irradianceSigma2 = (newIrradiance - oldIrradiance) * (newIrradiance - finalIrradiance);
+        float luminanceSigma2 = RTXGILinearRGBToLuminance(irradianceSigma2);
+        float luminanceMean = RTXGILinearRGBToLuminance(finalIrradiance);
+
+        const float c_variabilityThreshold = 1.0 / 1024.0;
+        float coefficientOfVariation = (luminanceMean <= c_variabilityThreshold) ?
+                                        0.0 :
+                                        sqrt(abs(luminanceSigma2)) / luminanceMean;
+
+        _ProbeVariability[irradiancePixel] = coefficientOfVariation;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSMonteCarloDistance(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchThreadId.z;
+    int2 localPixel = int2(dispatchThreadId.xy);
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    if (_ProbeDataWidth > 0)
+    {
+        uint probeState = GetProbeState(probeIndex);
+        if (probeState == DDGI_PROBE_STATE_INACTIVE)
+            return;
+    }
+
+    if (localPixel.x >= _DistanceAtlasSize.z || localPixel.y >= _DistanceAtlasSize.z)
+        return;
+
+    float2 uv = (float2(localPixel) + 0.5) / float(_DistanceAtlasSize.z);
+    float3 texelDirection = OctahedronDecode(uv);
+
+    float distanceSum = 0.0;
+    float distanceSqSum = 0.0;
+    float weightSum = 0.0;
+
+    float probeMaxRayDistance = _MaxRayDistance;
+
+    for (uint rayIndex = 0; rayIndex < _RaysPerProbe; rayIndex++)
+    {
+        float3 rayDir = GetRayDirection(rayIndex);
+        float cosWeight = dot(rayDir, texelDirection);
+
+        if (cosWeight <= 0.0)
+            continue;
+
+        uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIndex);
+        float4 radianceData = _RadianceBuffer[gBufferCoord];
+        float hitDistance = radianceData.w;
+
+        hitDistance = min(abs(hitDistance), probeMaxRayDistance);
+        if (radianceData.w < 0)
+            hitDistance = probeMaxRayDistance;
+
+        distanceSum += hitDistance * cosWeight;
+        distanceSqSum += hitDistance * hitDistance * cosWeight;
+        weightSum += cosWeight;
+    }
+
+    float epsilon = _RaysPerProbe * 1e-9;
+    float2 newDistance = float2(
+        distanceSum * rcp(2.0 * max(weightSum, epsilon)),
+        distanceSqSum * rcp(2.0 * max(weightSum, epsilon))
+    );
+
+    int2 distanceBaseCoord = GetProbePixelCoord(probeIndex, _DistanceAtlasSize.z, _DistanceAtlasSize.w, _GutterSize);
+    int2 distancePixel = distanceBaseCoord + localPixel;
+
+    float2 oldDistance = _DistanceAtlas_Prev[distancePixel];
+
+    float hysteresis = _Hysteresis;
+    if (dot(oldDistance, oldDistance) == 0.0)
+        hysteresis = 0.0;
+
+    float2 finalDistance = lerp(newDistance, oldDistance, hysteresis);
+
+    _DistanceAtlas[distancePixel] = finalDistance;
+}
+
+[numthreads(64, 1, 1)]
+void CSUpdateBorderRT(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchThreadId.x;
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    {
+        int probeRes = _IrradianceAtlasSize.z;
+        int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _IrradianceAtlasSize.w, _GutterSize);
+
+        for (int row = 0; row < probeRes; row++)
+        {
+
+            _IrradianceAtlas[baseCoord + int2(-1, row)] = _IrradianceAtlas[baseCoord + int2(0, probeRes - 1 - row)];
+
+            _IrradianceAtlas[baseCoord + int2(probeRes, row)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1 - row)];
+        }
+
+        for (int col = 0; col < probeRes; col++)
+        {
+
+            _IrradianceAtlas[baseCoord + int2(col, -1)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1 - col, 0)];
+
+            _IrradianceAtlas[baseCoord + int2(col, probeRes)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1 - col, probeRes - 1)];
+        }
+
+        _IrradianceAtlas[baseCoord + int2(-1, -1)] = _IrradianceAtlas[baseCoord + int2(0, 0)];
+        _IrradianceAtlas[baseCoord + int2(probeRes, -1)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, 0)];
+        _IrradianceAtlas[baseCoord + int2(-1, probeRes)] = _IrradianceAtlas[baseCoord + int2(0, probeRes - 1)];
+        _IrradianceAtlas[baseCoord + int2(probeRes, probeRes)] = _IrradianceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1)];
+    }
+
+    {
+        int probeRes = _DistanceAtlasSize.z;
+        int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _DistanceAtlasSize.w, _GutterSize);
+
+        for (int row = 0; row < probeRes; row++)
+        {
+            _DistanceAtlas[baseCoord + int2(-1, row)] = _DistanceAtlas[baseCoord + int2(0, probeRes - 1 - row)];
+            _DistanceAtlas[baseCoord + int2(probeRes, row)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1 - row)];
+        }
+
+        for (int col = 0; col < probeRes; col++)
+        {
+            _DistanceAtlas[baseCoord + int2(col, -1)] = _DistanceAtlas[baseCoord + int2(probeRes - 1 - col, 0)];
+            _DistanceAtlas[baseCoord + int2(col, probeRes)] = _DistanceAtlas[baseCoord + int2(probeRes - 1 - col, probeRes - 1)];
+        }
+
+        _DistanceAtlas[baseCoord + int2(-1, -1)] = _DistanceAtlas[baseCoord + int2(0, 0)];
+        _DistanceAtlas[baseCoord + int2(probeRes, -1)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, 0)];
+        _DistanceAtlas[baseCoord + int2(-1, probeRes)] = _DistanceAtlas[baseCoord + int2(0, probeRes - 1)];
+        _DistanceAtlas[baseCoord + int2(probeRes, probeRes)] = _DistanceAtlas[baseCoord + int2(probeRes - 1, probeRes - 1)];
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSUpdateBorderIrradiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint probeIndex = groupId.x;
+    uint borderPixelIndex = threadId.x;
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    int probeRes = _IrradianceAtlasSize.z;
+    int totalBorderPixels = 4 * probeRes + 4;
+
+    if (borderPixelIndex >= (uint)totalBorderPixels)
+        return;
+
+    int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _IrradianceAtlasSize.w, _GutterSize);
+
+    int2 dstOffset;
+    int2 srcOffset;
+
+    if (borderPixelIndex < (uint)probeRes)
+    {
+
+        int row = (int)borderPixelIndex;
+        dstOffset = int2(-1, row);
+        srcOffset = int2(0, probeRes - 1 - row);
+    }
+    else if (borderPixelIndex < (uint)(2 * probeRes))
+    {
+
+        int row = (int)borderPixelIndex - probeRes;
+        dstOffset = int2(probeRes, row);
+        srcOffset = int2(probeRes - 1, probeRes - 1 - row);
+    }
+    else if (borderPixelIndex < (uint)(3 * probeRes))
+    {
+
+        int col = (int)borderPixelIndex - 2 * probeRes;
+        dstOffset = int2(col, -1);
+        srcOffset = int2(probeRes - 1 - col, 0);
+    }
+    else if (borderPixelIndex < (uint)(4 * probeRes))
+    {
+
+        int col = (int)borderPixelIndex - 3 * probeRes;
+        dstOffset = int2(col, probeRes);
+        srcOffset = int2(probeRes - 1 - col, probeRes - 1);
+    }
+    else
+    {
+
+        uint cornerIndex = borderPixelIndex - 4 * probeRes;
+        if (cornerIndex == 0)
+        {
+
+            dstOffset = int2(-1, -1);
+            srcOffset = int2(0, 0);
+        }
+        else if (cornerIndex == 1)
+        {
+
+            dstOffset = int2(probeRes, -1);
+            srcOffset = int2(probeRes - 1, 0);
+        }
+        else if (cornerIndex == 2)
+        {
+
+            dstOffset = int2(-1, probeRes);
+            srcOffset = int2(0, probeRes - 1);
+        }
+        else
+        {
+
+            dstOffset = int2(probeRes, probeRes);
+            srcOffset = int2(probeRes - 1, probeRes - 1);
+        }
+    }
+
+    _IrradianceAtlas[baseCoord + dstOffset] = _IrradianceAtlas[baseCoord + srcOffset];
+}
+
+[numthreads(72, 1, 1)]
+void CSUpdateBorderDistance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint probeIndex = groupId.x;
+    uint borderPixelIndex = threadId.x;
+
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    int probeRes = _DistanceAtlasSize.z;
+    int totalBorderPixels = 4 * probeRes + 4;
+
+    if (borderPixelIndex >= (uint)totalBorderPixels)
+        return;
+
+    int2 baseCoord = GetProbePixelCoord(probeIndex, probeRes, _DistanceAtlasSize.w, _GutterSize);
+
+    int2 dstOffset;
+    int2 srcOffset;
+
+    if (borderPixelIndex < (uint)probeRes)
+    {
+
+        int row = (int)borderPixelIndex;
+        dstOffset = int2(-1, row);
+        srcOffset = int2(0, probeRes - 1 - row);
+    }
+    else if (borderPixelIndex < (uint)(2 * probeRes))
+    {
+
+        int row = (int)borderPixelIndex - probeRes;
+        dstOffset = int2(probeRes, row);
+        srcOffset = int2(probeRes - 1, probeRes - 1 - row);
+    }
+    else if (borderPixelIndex < (uint)(3 * probeRes))
+    {
+
+        int col = (int)borderPixelIndex - 2 * probeRes;
+        dstOffset = int2(col, -1);
+        srcOffset = int2(probeRes - 1 - col, 0);
+    }
+    else if (borderPixelIndex < (uint)(4 * probeRes))
+    {
+
+        int col = (int)borderPixelIndex - 3 * probeRes;
+        dstOffset = int2(col, probeRes);
+        srcOffset = int2(probeRes - 1 - col, probeRes - 1);
+    }
+    else
+    {
+
+        uint cornerIndex = borderPixelIndex - 4 * probeRes;
+        if (cornerIndex == 0)
+        {
+
+            dstOffset = int2(-1, -1);
+            srcOffset = int2(0, 0);
+        }
+        else if (cornerIndex == 1)
+        {
+
+            dstOffset = int2(probeRes, -1);
+            srcOffset = int2(probeRes - 1, 0);
+        }
+        else if (cornerIndex == 2)
+        {
+
+            dstOffset = int2(-1, probeRes);
+            srcOffset = int2(0, probeRes - 1);
+        }
+        else
+        {
+
+            dstOffset = int2(probeRes, probeRes);
+            srcOffset = int2(probeRes - 1, probeRes - 1);
+        }
+    }
+
+    _DistanceAtlas[baseCoord + dstOffset] = _DistanceAtlas[baseCoord + srcOffset];
+}

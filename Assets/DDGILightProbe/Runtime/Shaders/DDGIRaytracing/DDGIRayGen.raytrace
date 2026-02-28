@@ -1,0 +1,181 @@
+// ============================================================================
+// DDGI Ray Generation Shader
+// 从每个Probe发射光线，收集G-Buffer信息
+// ============================================================================
+
+#include "UnityShaderVariables.cginc"
+#include "DDGIGBuffer.hlsl"
+
+#pragma max_recursion_depth 1
+
+// ============================================================================
+// 全局资源
+// ============================================================================
+
+// 加速结构
+RaytracingAccelerationStructure _DDGIAccelStruct : register(t0, space1);
+
+// Probe数据
+StructuredBuffer<float4> _ProbePositions;   // xyz=位置, w=probeIndex
+uint _ProbeCount;                            // Probe总数
+uint _RaysPerProbe;                          // 每个Probe的光线数
+uint _FixedRayCount;                         // 固定光线数量（不旋转，用于Relocation/Classification）
+uint _FrameIndex;                            // 帧索引（用于旋转光线）
+float _RayMinDistance;                       // 光线最小距离
+float _RayMaxDistance;                       // 光线最大距离
+
+// 光线方向旋转（仅用于非固定光线）
+float _RayRotationAngle;                     // 光线旋转角度（弧度）
+float4x4 _RayRotationMatrix;                 // 光线旋转矩阵
+
+// 天空盒
+TextureCube<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+float _SkyboxIntensity;
+
+// Probe Relocation数据
+Texture2D<float4> _ProbeData;           // xyz=偏移量, w=状态
+uint _ProbeDataWidth;                   // ProbeData纹理宽度
+
+// ============================================================================
+// G-Buffer输出纹理
+// ============================================================================
+
+RWTexture2D<float4> _GBuffer_PositionDistance;  // xyz=position, w=distance
+RWTexture2D<float4> _GBuffer_NormalHitFlag;     // xyz=normal, w=hitFlag
+RWTexture2D<float4> _GBuffer_AlbedoRoughness;   // xyz=albedo, w=roughness
+RWTexture2D<float4> _GBuffer_EmissionMetallic;  // xyz=emission, w=metallic
+
+// G-Buffer纹理参数
+uint _GBufferWidth;
+uint _GBufferHeight;
+
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
+// 获取G-Buffer存储坐标
+uint2 GetGBufferCoord(uint probeIndex, uint rayIndex)
+{
+    uint linearIndex = probeIndex * _RaysPerProbe + rayIndex;
+    return uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+}
+
+// 获取光线方向（区分固定光线和随机光线）
+// 固定光线：用于Relocation/Classification，方向固定不旋转
+// 随机光线：用于光照计算，每帧旋转以增加采样覆盖
+float3 GetRayDirection(uint rayIndex)
+{
+    // 判断是否为固定光线
+    bool isFixedRay = (rayIndex < _FixedRayCount);
+
+    // 计算采样索引和总光线数
+    // 固定光线：使用前_FixedRayCount条的Fibonacci球面分布
+    // 随机光线：使用剩余光线的Fibonacci球面分布
+    uint sampleIndex = isFixedRay ? rayIndex : (rayIndex - _FixedRayCount);
+    uint numRays = isFixedRay ? _FixedRayCount : (_RaysPerProbe - _FixedRayCount);
+
+    // 基础Fibonacci球面方向
+    float3 dir = FibonacciSphereDirection(sampleIndex, numRays);
+
+    // 固定光线不旋转，保持时间稳定性
+    if (isFixedRay)
+        return normalize(dir);
+
+    // 随机光线应用旋转（每帧旋转以增加采样覆盖）
+    dir = mul((float3x3)_RayRotationMatrix, dir);
+    return normalize(dir);
+}
+
+// 获取探针偏移量
+float3 GetProbeOffset(uint probeIndex)
+{
+    uint2 probeDataCoord = uint2(probeIndex % _ProbeDataWidth, probeIndex / _ProbeDataWidth);
+    return _ProbeData[probeDataCoord].xyz;
+}
+
+// ============================================================================
+// Ray Generation Shader
+// ============================================================================
+
+[shader("raygeneration")]
+void DDGIRayGenShader()
+{
+    // 获取当前dispatch索引
+    uint dispatchIndex = DispatchRaysIndex().x;
+
+    // 计算Probe索引和光线索引
+    uint probeIndex = dispatchIndex / _RaysPerProbe;
+    uint rayIndex = dispatchIndex % _RaysPerProbe;
+
+    // 边界检查
+    if (probeIndex >= _ProbeCount)
+        return;
+
+    // 获取Probe基础位置
+    float3 probePosition = _ProbePositions[probeIndex].xyz;
+
+    // 应用Probe Relocation偏移
+    float3 probeOffset = GetProbeOffset(probeIndex);
+    probePosition += probeOffset;
+
+    // 获取光线方向
+    float3 rayDirection = GetRayDirection(rayIndex);
+    
+    // 构建光线
+    RayDesc ray;
+    ray.Origin = probePosition;
+    ray.Direction = rayDirection;
+    ray.TMin = _RayMinDistance;
+    ray.TMax = _RayMaxDistance;
+    
+    // 初始化Payload
+    DDGIRayPayload payload = InitDDGIRayPayload();
+    
+    // 追踪光线
+    TraceRay(
+        _DDGIAccelStruct,
+        RAY_FLAG_NONE,  
+        0xFF,                                   // Instance mask
+        0,                                      // Hit group index
+        1,                                      // Hit group stride
+        0,                                      // Miss shader index
+        ray,
+        payload
+    );
+    
+    // 处理Miss情况 - 采样天空盒
+    if (payload.hitFlag == 0)
+    {
+        float3 skyColor = _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, rayDirection, 0).rgb;
+        payload.emission = skyColor * _SkyboxIntensity;
+        // RTXGI: Miss时hitDistance设为1e27f（非常大），这样在Relocation中会成为farthest frontface
+        // 不能用_RayMaxDistance（如100），否则会被误认为是很近的frontface
+        payload.hitDistance = 1e27f;
+        payload.position = probePosition + rayDirection * _RayMaxDistance;
+        payload.normal = -rayDirection;
+    }
+    
+    // 计算G-Buffer存储坐标
+    uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIndex);
+    
+    // 写入G-Buffer
+    // 注意：hitFlag作为float直接写入，不使用asfloat位转换
+    // 因为G-Buffer纹理为R16G16B16A16_SFloat（半精度），位模式会丢失
+    _GBuffer_PositionDistance[gBufferCoord] = float4(payload.position, payload.hitDistance);
+    _GBuffer_NormalHitFlag[gBufferCoord] = float4(payload.normal, float(payload.hitFlag));
+    _GBuffer_AlbedoRoughness[gBufferCoord] = float4(payload.albedo, payload.roughness);
+    _GBuffer_EmissionMetallic[gBufferCoord] = float4(payload.emission, payload.metallic);
+}
+
+// ============================================================================
+// Miss Shader
+// ============================================================================
+
+[shader("miss")]
+void DDGIMissShader(inout DDGIRayPayload payload : SV_RayPayload)
+{
+    // 标记为miss
+    payload.hitFlag = 0;
+    payload.hitDistance = -1.0;
+}

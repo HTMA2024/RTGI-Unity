@@ -1,0 +1,272 @@
+#pragma only_renderers d3d11 vulkan metal
+#pragma kernel TemporalFilter
+#pragma kernel CopyHistory
+#pragma kernel CopyNormals
+#pragma kernel CopyDepth
+#pragma kernel CopyNormalsDual
+#pragma kernel CopyDepthDual
+#pragma kernel CopyMotionVectors
+
+#pragma multi_compile _ _SSGI_ACCURATE_NORMALS
+
+#include "SSGICommon.hlsl"
+
+#define TEMPORAL_FILTER_TILE_SIZE 8
+
+float _PixelSpreadAngleTangent;
+float4 _FullScreenSize;
+
+float4x4 _PrevVPMatrix;
+float4x4 _PrevInvVPMatrix;
+
+float _ExposureMultiplier;
+float _PrevExposureMultiplier;
+
+Texture2D<float3> _SSGICurrentFrameTexture;
+Texture2D<float4> _SSGIHistoryTexture;
+Texture2D<float>  _DepthPyramidTexture;
+Texture2D<float>  _HistoryDepthTexture;
+Texture2D<float4> _HistoryNormalTexture;
+
+Texture2D<float2> _HistoryObjectMotionTexture;
+
+RWTexture2D<float4> _TemporalFilterOutputRW;
+RWTexture2D<float4> _HistoryOutputRW;
+
+half3 DecodeHistoryNormal(uint2 coord)
+{
+    float3 raw = LOAD_TEXTURE2D(_HistoryNormalTexture, coord).xyz;
+#ifdef _SSGI_ACCURATE_NORMALS
+    return (half3)SSGIUnpackNormalOctQuadEncode(raw);
+#else
+    return (half3)(raw * 2.0 - 1.0);
+#endif
+}
+
+#define MAX_NORMAL_DIFFERENCE 0.65
+#define MAX_REPROJECTION_DISTANCE 0.1
+#define MAX_PIXEL_TOLERANCE 4
+#define PROJECTION_EPSILON 0.000001
+
+float3 ReconstructWorldPosition(uint2 fullResCoord, float rawDepth)
+{
+    float2 uv = (fullResCoord + 0.5) * _FullScreenSize.zw;
+    float2 posCS = uv * 2.0 - 1.0;
+#if UNITY_UV_STARTS_AT_TOP
+    posCS.y = -posCS.y;
+#endif
+    float4 hpositionWS = mul(unity_MatrixInvVP, float4(posCS, rawDepth, 1.0));
+    return hpositionWS.xyz * rcp(hpositionWS.w);
+}
+
+float3 ReconstructPrevWorldPosition(float2 uv, float rawDepth)
+{
+    float2 posCS = uv * 2.0 - 1.0;
+#if UNITY_UV_STARTS_AT_TOP
+    posCS.y = -posCS.y;
+#endif
+    float4 hpositionWS = mul(_PrevInvVPMatrix, float4(posCS, rawDepth, 1.0));
+    return hpositionWS.xyz * rcp(hpositionWS.w);
+}
+
+float ComputeMaxReprojectionWorldRadius(float3 posWS, float3 normalWS)
+{
+    float3 viewWS = normalize(-posWS);
+    float parallelPixelFootPrint = _PixelSpreadAngleTangent * length(posWS);
+    float realPixelFootPrint = parallelPixelFootPrint * rcp(abs(dot(normalWS, viewWS)) + PROJECTION_EPSILON);
+    return max(MAX_REPROJECTION_DISTANCE, realPixelFootPrint * MAX_PIXEL_TOLERANCE);
+}
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void TemporalFilter(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+
+    float2 workUV = (pixelCoord + 0.5) * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)(workUV * _FullScreenSize.xy);
+
+    float depth = LOAD_TEXTURE2D(_DepthPyramidTexture, fullResCoord).r;
+    if (depth == UNITY_RAW_FAR_CLIP_VALUE)
+    {
+        _TemporalFilterOutputRW[pixelCoord] = float4(0.0, 0.0, 0.0, 0.0);
+        _HistoryOutputRW[pixelCoord] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float2 posCS = workUV * 2.0 - 1.0;
+#if UNITY_UV_STARTS_AT_TOP
+    posCS.y = -posCS.y;
+#endif
+
+    float4 hposWS = mul(unity_MatrixInvVP, float4(posCS, depth, 1.0));
+    float3 currentPosWS = hposWS.xyz * rcp(hposWS.w);
+
+    float4 prevClip = mul(_PrevVPMatrix, float4(currentPosWS, 1.0));
+    float2 prevNDC = prevClip.xy * rcp(prevClip.w);
+#if UNITY_UV_STARTS_AT_TOP
+    prevNDC.y = -prevNDC.y;
+#endif
+    float2 prevUV = prevNDC * 0.5 + 0.5;
+
+    float uvValid = step(0.0, prevUV.x) * step(prevUV.x, 1.0)
+                  * step(0.0, prevUV.y) * step(prevUV.y, 1.0);
+
+    uint2 prevCoord = (uint2)(prevUV * _SSGIScreenSize.xy);
+
+    half3 currentNormal = (half3)DecodeNormalURP(fullResCoord);
+
+    float historyDepth = LOAD_TEXTURE2D(_HistoryDepthTexture, prevCoord).r;
+    float3 historyPosWS = ReconstructPrevWorldPosition(prevUV, historyDepth);
+
+    float maxRadius = ComputeMaxReprojectionWorldRadius(currentPosWS, (float3)currentNormal);
+    float positionValid = step(length(historyPosWS - currentPosWS), maxRadius);
+
+    half3 historyNormal = DecodeHistoryNormal(prevCoord);
+    float normalValid = step(MAX_NORMAL_DIFFERENCE, (float)dot(historyNormal, currentNormal));
+
+    float historyValid = uvValid * positionValid * normalValid;
+
+    float2 objectMotion = LOAD_TEXTURE2D(_HistoryObjectMotionTexture, prevCoord).xy;
+    float screenScale = max(_FullScreenSize.x, _FullScreenSize.y);
+    float objectMotionPixels = length(objectMotion) * screenScale;
+
+    float motionAmount = smoothstep(4.0, 16.0, objectMotionPixels);
+    historyValid *= 1.0 - motionAmount;
+
+    float3 currentGI = LOAD_TEXTURE2D(_SSGICurrentFrameTexture, pixelCoord).rgb;
+
+    float4 historyData = SAMPLE_TEXTURE2D_LOD(_SSGIHistoryTexture, sampler_LinearClamp, prevUV, 0);
+    float3 historyGI = max(historyData.rgb, 0.0);
+    float sampleCount = historyData.a;
+
+    float exposureRatio = _ExposureMultiplier * rcp(_PrevExposureMultiplier);
+
+    float invExposureRatio = _PrevExposureMultiplier * rcp(_ExposureMultiplier);
+    float maxRatio = max(exposureRatio, invExposureRatio);
+
+    float exposureValid = step(maxRatio, 2.0);
+
+    historyGI *= exposureRatio * exposureValid;
+    sampleCount *= exposureValid;
+
+    float accumulationFactor = 0.0;
+
+    float invalidMask = 1.0 - historyValid * step(0.5, sampleCount);
+
+    float validFactor = sampleCount >= 8.0 ? 0.93 : sampleCount * rcp(sampleCount + 1.0);
+    float validCount = min(sampleCount + 1.0, 8.0);
+
+    float motionOnly = step(0.5, uvValid * positionValid * normalValid);
+    float invalidFactor = motionOnly * 3.0 * rcp(4.0);
+    float invalidCount = lerp(1.0, 4.0, motionOnly);
+
+    accumulationFactor = lerp(validFactor, invalidFactor, invalidMask);
+    sampleCount = lerp(validCount, invalidCount, invalidMask);
+
+    historyGI *= 1.0 - invalidMask * (1.0 - motionOnly);
+
+    float3 output = currentGI * (1.0 - accumulationFactor) + historyGI * accumulationFactor;
+
+    output = IsNaN(output.x) ? 0.0 : output;
+
+    _TemporalFilterOutputRW[pixelCoord] = float4(output, sampleCount);
+
+    _HistoryOutputRW[pixelCoord] = float4(output, sampleCount);
+}
+
+RWTexture2D<float4> _DenoiseOutputTextureRW;
+Texture2D<float4>   _DenoiseInputTexture;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyHistory(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    _DenoiseOutputTextureRW[coord] = LOAD_TEXTURE2D(_DenoiseInputTexture, coord);
+}
+
+RWTexture2D<float4> _HistoryNormalOutputRW;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyNormals(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)coord * resScale);
+
+    float4 normalData = LOAD_TEXTURE2D(_CameraNormalsTexture, fullResCoord);
+    _HistoryNormalOutputRW[coord] = normalData;
+}
+
+Texture2D<float>   _CameraDepthTexture;
+RWTexture2D<float> _HistoryDepthOutputRW;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)coord * resScale);
+    _HistoryDepthOutputRW[coord] = LOAD_TEXTURE2D(_CameraDepthTexture, fullResCoord).r;
+}
+
+RWTexture2D<float4> _HistoryNormalOutputRW2;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyNormalsDual(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)coord * resScale);
+    float4 normalData = LOAD_TEXTURE2D(_CameraNormalsTexture, fullResCoord);
+    _HistoryNormalOutputRW[coord] = normalData;
+    _HistoryNormalOutputRW2[coord] = normalData;
+}
+
+RWTexture2D<float> _HistoryDepthOutputRW2;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyDepthDual(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)coord * resScale);
+    float depth = LOAD_TEXTURE2D(_CameraDepthTexture, fullResCoord).r;
+    _HistoryDepthOutputRW[coord] = depth;
+    _HistoryDepthOutputRW2[coord] = depth;
+}
+
+float4x4 _InvNonJitteredViewProjMatrix;
+
+RWTexture2D<float2> _HistoryMotionVectorOutputRW;
+
+[numthreads(TEMPORAL_FILTER_TILE_SIZE, TEMPORAL_FILTER_TILE_SIZE, 1)]
+void CopyMotionVectors(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadId.xy;
+    float2 resScale = _FullScreenSize.xy * _SSGIScreenSize.zw;
+    uint2 fullResCoord = (uint2)((float2)coord * resScale);
+
+    float2 fullMV = LOAD_TEXTURE2D(_CameraMotionVectorsTexture, fullResCoord).xy;
+
+    float depth = LOAD_TEXTURE2D(_CameraDepthTexture, fullResCoord).r;
+    float2 uv = (fullResCoord + 0.5) * _FullScreenSize.zw;
+    float2 posNDC = uv * 2.0 - 1.0;
+#if UNITY_UV_STARTS_AT_TOP
+    posNDC.y = -posNDC.y;
+#endif
+    float4 hposWS = mul(_InvNonJitteredViewProjMatrix, float4(posNDC, depth, 1.0));
+    float3 posWS = hposWS.xyz * rcp(hposWS.w);
+
+    float4 prevPosCS = mul(_PrevViewProjMatrix, float4(posWS, 1.0));
+    float2 prevPosNDC = prevPosCS.xy * rcp(prevPosCS.w);
+    float2 cameraMV = (posNDC - prevPosNDC);
+#if UNITY_UV_STARTS_AT_TOP
+    cameraMV.y = -cameraMV.y;
+#endif
+    cameraMV *= 0.5;
+
+    float2 objectMotion = fullMV - cameraMV;
+
+    _HistoryMotionVectorOutputRW[coord] = objectMotion;
+}

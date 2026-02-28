@@ -1,0 +1,193 @@
+#pragma kernel CSVariabilityReduction
+#pragma kernel CSVariabilityExtraReduction
+
+Texture2D<float> _ProbeVariability;
+
+Texture2D<float2> _ProbeVariabilityReadOnly;
+
+RWTexture2D<float2> _ProbeVariabilityAverage;
+
+uint2 _InputSize;
+uint2 _OutputSize;
+
+Texture2D<float4> _ProbeData;
+uint _ProbeDataWidth;
+uint _ProbeCount;
+
+int4 _IrradianceAtlasSize;
+int _GutterSize;
+
+#define THREAD_GROUP_SIZE_X 4
+#define THREAD_GROUP_SIZE_Y 4
+#define THREAD_GROUP_SIZE (THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y)
+
+#define THREAD_FOOTPRINT_X 4
+#define THREAD_FOOTPRINT_Y 4
+
+#define REDUCTION_FACTOR_X (THREAD_GROUP_SIZE_X * THREAD_FOOTPRINT_X)
+#define REDUCTION_FACTOR_Y (THREAD_GROUP_SIZE_Y * THREAD_FOOTPRINT_Y)
+
+groupshared float gs_Sum[THREAD_GROUP_SIZE];
+groupshared float gs_Weight[THREAD_GROUP_SIZE];
+
+#define DDGI_PROBE_STATE_ACTIVE   0
+#define DDGI_PROBE_STATE_INACTIVE 1
+
+int GetProbeIndexFromAtlasCoord(int2 atlasCoord)
+{
+    int probeResolution = _IrradianceAtlasSize.z;
+    int probesPerRow = _IrradianceAtlasSize.w;
+    int probeSizeWithGutter = probeResolution + _GutterSize * 2;
+
+    int probeX = atlasCoord.x / probeSizeWithGutter;
+    int probeY = atlasCoord.y / probeSizeWithGutter;
+
+    int localX = atlasCoord.x % probeSizeWithGutter;
+    int localY = atlasCoord.y % probeSizeWithGutter;
+
+    if (localX < _GutterSize || localX >= probeResolution + _GutterSize ||
+        localY < _GutterSize || localY >= probeResolution + _GutterSize)
+    {
+        return -1;
+    }
+
+    int probeIndex = probeY * probesPerRow + probeX;
+    return (probeIndex < (int)_ProbeCount) ? probeIndex : -1;
+}
+
+uint GetProbeState(int probeIndex)
+{
+    if (probeIndex < 0 || _ProbeDataWidth == 0)
+        return DDGI_PROBE_STATE_ACTIVE;
+
+    uint2 coord = uint2(probeIndex % _ProbeDataWidth, probeIndex / _ProbeDataWidth);
+    return (uint)_ProbeData[coord].w;
+}
+
+void ReduceInGroup(uint threadIndex)
+{
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint stride = THREAD_GROUP_SIZE / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIndex < stride)
+        {
+            gs_Sum[threadIndex] += gs_Sum[threadIndex + stride];
+            gs_Weight[threadIndex] += gs_Weight[threadIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void CSVariabilityReduction(
+    uint3 groupId : SV_GroupID,
+    uint3 groupThreadId : SV_GroupThreadID,
+    uint threadIndex : SV_GroupIndex)
+{
+
+    uint2 groupBaseCoord = groupId.xy * uint2(REDUCTION_FACTOR_X, REDUCTION_FACTOR_Y);
+    uint2 threadOffset = groupThreadId.xy * uint2(THREAD_FOOTPRINT_X, THREAD_FOOTPRINT_Y);
+    uint2 startCoord = groupBaseCoord + threadOffset;
+
+    float localSum = 0.0;
+    float localWeight = 0.0;
+
+    [unroll]
+    for (uint y = 0; y < THREAD_FOOTPRINT_Y; y++)
+    {
+        [unroll]
+        for (uint x = 0; x < THREAD_FOOTPRINT_X; x++)
+        {
+            uint2 coord = startCoord + uint2(x, y);
+
+            if (coord.x >= _InputSize.x || coord.y >= _InputSize.y)
+                continue;
+
+            int probeIndex = GetProbeIndexFromAtlasCoord(int2(coord));
+
+            if (probeIndex < 0)
+                continue;
+
+            if (GetProbeState(probeIndex) == DDGI_PROBE_STATE_INACTIVE)
+                continue;
+
+            float value = _ProbeVariability[coord];
+
+            localSum += value;
+            localWeight += 1.0;
+        }
+    }
+
+    gs_Sum[threadIndex] = localSum;
+    gs_Weight[threadIndex] = localWeight;
+
+    ReduceInGroup(threadIndex);
+
+    if (threadIndex == 0)
+    {
+        float totalWeight = gs_Weight[0];
+        float totalSum = gs_Sum[0];
+
+        float average = (totalWeight > 0.0) ? (totalSum / totalWeight) : 0.0;
+
+        float maxSamples = (float)(THREAD_GROUP_SIZE * THREAD_FOOTPRINT_X * THREAD_FOOTPRINT_Y);
+        float normalizedWeight = totalWeight / maxSamples;
+
+        _ProbeVariabilityAverage[groupId.xy] = float2(average, normalizedWeight);
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void CSVariabilityExtraReduction(
+    uint3 groupId : SV_GroupID,
+    uint3 groupThreadId : SV_GroupThreadID,
+    uint threadIndex : SV_GroupIndex)
+{
+
+    uint2 groupBaseCoord = groupId.xy * uint2(REDUCTION_FACTOR_X, REDUCTION_FACTOR_Y);
+    uint2 threadOffset = groupThreadId.xy * uint2(THREAD_FOOTPRINT_X, THREAD_FOOTPRINT_Y);
+    uint2 startCoord = groupBaseCoord + threadOffset;
+
+    float localWeightedSum = 0.0;
+    float localWeightSum = 0.0;
+
+    [unroll]
+    for (uint y = 0; y < THREAD_FOOTPRINT_Y; y++)
+    {
+        [unroll]
+        for (uint x = 0; x < THREAD_FOOTPRINT_X; x++)
+        {
+            uint2 coord = startCoord + uint2(x, y);
+
+            if (coord.x >= _InputSize.x || coord.y >= _InputSize.y)
+                continue;
+
+            float2 data = _ProbeVariabilityReadOnly[coord];
+            float value = data.r;
+            float weight = data.g;
+
+            localWeightedSum += value * weight;
+            localWeightSum += weight;
+        }
+    }
+
+    gs_Sum[threadIndex] = localWeightedSum;
+    gs_Weight[threadIndex] = localWeightSum;
+
+    ReduceInGroup(threadIndex);
+
+    if (threadIndex == 0)
+    {
+        float totalWeightSum = gs_Weight[0];
+        float totalWeightedSum = gs_Sum[0];
+
+        float average = (totalWeightSum > 0.0) ? (totalWeightedSum / totalWeightSum) : 0.0;
+
+        float maxWeight = (float)(THREAD_GROUP_SIZE * THREAD_FOOTPRINT_X * THREAD_FOOTPRINT_Y);
+        float normalizedWeight = totalWeightSum / maxWeight;
+
+        _ProbeVariabilityAverage[groupId.xy] = float2(average, normalizedWeight);
+    }
+}

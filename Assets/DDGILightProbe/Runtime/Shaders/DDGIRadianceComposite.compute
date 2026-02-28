@@ -1,0 +1,57 @@
+#pragma kernel CSRadianceComposite
+
+#define PI 3.14159265359
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+Texture2D<float4> _GBuffer_AlbedoRoughness;
+Texture2D<float4> _GBuffer_EmissionMetallic;
+
+Texture2D<float4> _DirectIrradianceBuffer;
+Texture2D<float4> _IndirectIrradianceBuffer;
+
+RWTexture2D<float4> _RadianceBuffer;
+
+uint _GBufferWidth;
+uint _GBufferHeight;
+uint _RaysPerProbe;
+uint _ProbeCount;
+
+float _IndirectIntensity;
+float _MaxRayDistance;
+
+[numthreads(64, 1, 1)]
+void CSRadianceComposite(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint linearIndex = dispatchID.x;
+
+    uint2 texCoord = uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+
+    if (texCoord.x >= _GBufferWidth || texCoord.y >= _GBufferHeight)
+        return;
+
+    float4 positionDistance = _GBuffer_PositionDistance[texCoord];
+    float4 normalHitFlag = _GBuffer_NormalHitFlag[texCoord];
+    float4 albedoRoughness = _GBuffer_AlbedoRoughness[texCoord];
+    float4 emissionMetallic = _GBuffer_EmissionMetallic[texCoord];
+
+    float hitDistance = positionDistance.w;
+
+    float hitFlag = normalHitFlag.w;
+    float3 albedo = albedoRoughness.rgb;
+    float3 emission = emissionMetallic.rgb;
+
+    if (hitFlag < 0.5)
+    {
+        _RadianceBuffer[texCoord] = float4(emission, hitDistance);
+        return;
+    }
+
+    float3 directIrradiance = _DirectIrradianceBuffer[texCoord].rgb;
+    float3 indirectIrradiance = _IndirectIrradianceBuffer[texCoord].rgb * _IndirectIntensity;
+
+    float3 totalIrradiance = directIrradiance + indirectIrradiance;
+    float3 outgoingRadiance = emission + albedo * (totalIrradiance * (1.0 / PI));
+
+    _RadianceBuffer[texCoord] = float4(outgoingRadiance, hitDistance);
+}

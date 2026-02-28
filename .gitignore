@@ -1,0 +1,74 @@
+# =============== #
+# Unity generated  #
+# =============== #
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]serSettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# ===================================== #
+# Visual Studio / Rider / IDE generated #
+# ===================================== #
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# ============ #
+# OS generated  #
+# ============ #
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ======================== #
+# Unity asset meta (keep!) #
+# ======================== #
+# Never ignore .meta files as they are important for Unity
+
+# ============ #
+# Builds       #
+# ============ #
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# ======================== #
+# Crashlytics / Misc       #
+# ======================== #
+crashlytics-build.properties
+sysinfo.txt
+*.stackdump
+
+# ======================== #
+# Packaging                #
+# ======================== #
+/[Aa]ssets/AssetStoreTools*
+
+# ======================== #
+# Plastic SCM              #
+# ======================== #
+*.ignore.conf

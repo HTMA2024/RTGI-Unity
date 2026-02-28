@@ -1,0 +1,152 @@
+#pragma kernel CSProbeClassification
+#pragma kernel CSProbeClassificationReset
+
+#include "DDGIRaytracing/DDGIGBuffer.hlsl"
+
+#define DDGI_PROBE_STATE_ACTIVE   0   // 活跃状态，正常更新和采样
+#define DDGI_PROBE_STATE_INACTIVE 1   // 非活跃状态，跳过更新和采样
+
+Texture2D<float4> _GBuffer_PositionDistance;
+Texture2D<float4> _GBuffer_NormalHitFlag;
+
+RWTexture2D<float4> _ProbeData;
+
+int _ProbeCount;
+int _RaysPerProbe;
+int _FixedRayCount;
+int _GBufferWidth;
+int _ProbeDataWidth;
+float3 _ProbeSpacing;
+float _BackfaceThreshold;
+float3 _VolumeOrigin;
+int4 _VolumeProbeCounts;
+
+uint2 GetProbeDataCoord(uint probeIndex)
+{
+    return uint2(probeIndex % _ProbeDataWidth, probeIndex / _ProbeDataWidth);
+}
+
+uint2 GetGBufferCoord(uint probeIndex, uint rayIndex)
+{
+    uint linearIndex = probeIndex * _RaysPerProbe + rayIndex;
+    return uint2(linearIndex % _GBufferWidth, linearIndex / _GBufferWidth);
+}
+
+float3 GetFixedRayDirection(uint rayIndex)
+{
+    float3 dir = FibonacciSphereDirection(rayIndex, _FixedRayCount);
+    return normalize(dir);
+}
+
+int3 GetProbeGridCoords(uint probeIndex)
+{
+    int3 coords;
+    coords.x = probeIndex % _VolumeProbeCounts.x;
+    coords.y = (probeIndex / _VolumeProbeCounts.x) % _VolumeProbeCounts.y;
+    coords.z = probeIndex / (_VolumeProbeCounts.x * _VolumeProbeCounts.y);
+    return coords;
+}
+
+float3 GetProbeWorldPosition(uint probeIndex)
+{
+    int3 coords = GetProbeGridCoords(probeIndex);
+    float3 gridPosition = _VolumeOrigin + float3(coords) * _ProbeSpacing;
+
+    uint2 probeDataCoord = GetProbeDataCoord(probeIndex);
+    float3 relocationOffset = _ProbeData[probeDataCoord].xyz;
+
+    return gridPosition + relocationOffset;
+}
+
+float GetDistanceToVoxelBoundary(float3 rayDir, float3 spacing)
+{
+
+    float3 absDir = abs(rayDir);
+    float3 invDir = 1.0 / max(absDir, 0.000001);
+
+    float3 distances = spacing * invDir;
+
+    distances.x = absDir.x < 0.000001 ? 1e27 : distances.x;
+    distances.y = absDir.y < 0.000001 ? 1e27 : distances.y;
+    distances.z = absDir.z < 0.000001 ? 1e27 : distances.z;
+
+    return min(distances.x, min(distances.y, distances.z));
+}
+
+[numthreads(32, 1, 1)]
+void CSProbeClassification(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchID.x;
+    if (probeIndex >= (uint)_ProbeCount)
+        return;
+
+    int numRays = min(_RaysPerProbe, _FixedRayCount);
+
+    int backfaceCount = 0;
+    bool hasNearbyGeometry = false;
+
+    for (int rayIdx = 0; rayIdx < numRays; rayIdx++)
+    {
+
+        uint2 gBufferCoord = GetGBufferCoord(probeIndex, rayIdx);
+        float4 positionDistance = _GBuffer_PositionDistance[gBufferCoord];
+        float4 normalHitFlag = _GBuffer_NormalHitFlag[gBufferCoord];
+
+        float hitDistance = positionDistance.w;
+        uint hitFlag = (uint)normalHitFlag.w;
+
+        if (hitFlag == 2 || hitDistance < 0)
+        {
+            backfaceCount++;
+            continue;
+        }
+
+        if (hitFlag == 0)
+            continue;
+
+        float3 rayDir = GetFixedRayDirection(rayIdx);
+        float maxDistToVoxel = GetDistanceToVoxelBoundary(rayDir, _ProbeSpacing);
+
+        if (hitDistance <= maxDistToVoxel)
+        {
+            hasNearbyGeometry = true;
+
+            break;
+        }
+    }
+
+    uint2 probeDataCoord = GetProbeDataCoord(probeIndex);
+    float4 probeData = _ProbeData[probeDataCoord];
+
+    float backfaceRatio = (float)backfaceCount / (float)numRays;
+    if (backfaceRatio > _BackfaceThreshold)
+    {
+        probeData.w = DDGI_PROBE_STATE_INACTIVE;
+        _ProbeData[probeDataCoord] = probeData;
+        return;
+    }
+
+    if (hasNearbyGeometry)
+    {
+        probeData.w = DDGI_PROBE_STATE_ACTIVE;
+        _ProbeData[probeDataCoord] = probeData;
+        return;
+    }
+
+    probeData.w = DDGI_PROBE_STATE_INACTIVE;
+    _ProbeData[probeDataCoord] = probeData;
+}
+
+[numthreads(32, 1, 1)]
+void CSProbeClassificationReset(uint3 dispatchID : SV_DispatchThreadID)
+{
+    uint probeIndex = dispatchID.x;
+    if (probeIndex >= (uint)_ProbeCount)
+        return;
+
+    uint2 probeDataCoord = GetProbeDataCoord(probeIndex);
+    float4 probeData = _ProbeData[probeDataCoord];
+
+    probeData.w = DDGI_PROBE_STATE_ACTIVE;
+    _ProbeData[probeDataCoord] = probeData;
+}

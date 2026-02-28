@@ -1,0 +1,150 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &-6949280867419426849
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 584757c8791d45148b3b16875d847ed1, type: 3}
+  m_Name: HTrace Ambient Occlusion
+  m_EditorClassIdentifier: 
+  m_Active: 1
+--- !u!114 &-6327876073423932986
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 649668fdb1e61d643bc8e663d4e98390, type: 3}
+  m_Name: SSGIRendererFeature
+  m_EditorClassIdentifier: 
+  m_Active: 1
+  ssgiComputeShader: {fileID: 7200000, guid: d2f19606fae808e42a6e819802b32ce2, type: 3}
+  depthPyramidComputeShader: {fileID: 7200000, guid: 4a444ded509129a4185627d03d6705d5,
+    type: 3}
+  colorPyramidComputeShader: {fileID: 7200000, guid: 9b82e02bbeeda9a45ac0bcd5c8bb66b1,
+    type: 3}
+  bilateralUpsampleComputeShader: {fileID: 7200000, guid: 469e6bb8a4a01a248b77686ecaa9908d,
+    type: 3}
+  blueNoiseTexture: {fileID: 2800000, guid: 5ca0e961077b9c34c8bc175352a1c4a3, type: 3}
+  owenScrambledTexture: {fileID: 2800000, guid: 38ccfc376e7f6f14ab6931aca8e8ae29,
+    type: 3}
+  scramblingTile8SPP: {fileID: 2800000, guid: 6ea54167a045e284a889ce41b1eba6b1, type: 3}
+  rankingTile8SPP: {fileID: 2800000, guid: b1528277bcb29fa43a00f34cdfdafc2b, type: 3}
+  temporalFilterComputeShader: {fileID: 7200000, guid: c3fd19d8fefcde0429e5dc5edfe6ae91,
+    type: 3}
+  diffuseDenoiserComputeShader: {fileID: 7200000, guid: dc70055de39c24149bd6c487b8af7414,
+    type: 3}
+  compositeShader: {fileID: 4800000, guid: a3e6d8fe44d1a76479a0aebbf2ad0f9f, type: 3}
+  rtgiRayTracingShader: {fileID: 4807578003741378534, guid: 2e90cb6224b5209438e8a034c1b3bcc1,
+    type: 3}
+  deferredLightingComputeShader: {fileID: 7200000, guid: b5d8a49f37bc5144b8e5d60757a15557,
+    type: 3}
+--- !u!114 &-4851450980318263586
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d6859cd920ef4404cb3d3243c71a4ff6, type: 3}
+  m_Name: DDGIApplyGIRendererFeature
+  m_EditorClassIdentifier: 
+  m_Active: 0
+  settings:
+    giIntensity: 1
+    aoIntensity: 1
+    renderPassEvent: 220
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: de640fe3d0db1804a85f9fc8f5cadab6, type: 3}
+  m_Name: DefaultURP_Renderer
+  m_EditorClassIdentifier: 
+  debugShaders:
+    debugReplacementPS: {fileID: 4800000, guid: cf852408f2e174538bcd9b7fda1c5ae7,
+      type: 3}
+    hdrDebugViewPS: {fileID: 4800000, guid: 573620ae32aec764abd4d728906d2587, type: 3}
+  m_RendererFeatures:
+  - {fileID: -6327876073423932986}
+  - {fileID: 226138551534882000}
+  - {fileID: -4851450980318263586}
+  - {fileID: -6949280867419426849}
+  m_RendererFeatureMap: c671dfdc3cde2ea8d00c4282d0672303dec6e898092facbc
+  m_UseNativeRenderPass: 0
+  postProcessData: {fileID: 11400000, guid: 41439944d30ece34e96484bdb6645b55, type: 2}
+  xrSystemData: {fileID: 11400000, guid: 60e1133243b97e347b653163a8c01b64, type: 2}
+  shaders:
+    blitPS: {fileID: 4800000, guid: c17132b1f77d20942aa75f8429c0f8bc, type: 3}
+    copyDepthPS: {fileID: 4800000, guid: d6dae50ee9e1bfa4db75f19f99355220, type: 3}
+    screenSpaceShadowPS: {fileID: 0}
+    samplingPS: {fileID: 4800000, guid: 04c410c9937594faa893a11dceb85f7e, type: 3}
+    stencilDeferredPS: {fileID: 4800000, guid: e9155b26e1bc55942a41e518703fe304, type: 3}
+    fallbackErrorPS: {fileID: 4800000, guid: e6e9a19c3678ded42a3bc431ebef7dbd, type: 3}
+    fallbackLoadingPS: {fileID: 4800000, guid: 7f888aff2ac86494babad1c2c5daeee2, type: 3}
+    materialErrorPS: {fileID: 4800000, guid: 5fd9a8feb75a4b5894c241777f519d4e, type: 3}
+    coreBlitPS: {fileID: 4800000, guid: 93446b5c5339d4f00b85c159e1159b7c, type: 3}
+    coreBlitColorAndDepthPS: {fileID: 4800000, guid: d104b2fc1ca6445babb8e90b0758136b,
+      type: 3}
+    blitHDROverlay: {fileID: 4800000, guid: a89bee29cffa951418fc1e2da94d1959, type: 3}
+    cameraMotionVector: {fileID: 4800000, guid: c56b7e0d4c7cb484e959caeeedae9bbf,
+      type: 3}
+    objectMotionVector: {fileID: 4800000, guid: 7b3ede40266cd49a395def176e1bc486,
+      type: 3}
+    dataDrivenLensFlare: {fileID: 4800000, guid: 6cda457ac28612740adb23da5d39ea92,
+      type: 3}
+    terrainDetailLitPS: {fileID: 4800000, guid: f6783ab646d374f94b199774402a5144,
+      type: 3}
+    terrainDetailGrassPS: {fileID: 4800000, guid: e507fdfead5ca47e8b9a768b51c291a1,
+      type: 3}
+    terrainDetailGrassBillboardPS: {fileID: 4800000, guid: 29868e73b638e48ca99a19ea58c48d90,
+      type: 3}
+  m_AssetVersion: 2
+  m_OpaqueLayerMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  m_TransparentLayerMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  m_DefaultStencilState:
+    overrideStencilState: 0
+    stencilReference: 0
+    stencilCompareFunction: 8
+    passOperation: 2
+    failOperation: 0
+    zFailOperation: 0
+  m_ShadowTransparentReceive: 1
+  m_RenderingMode: 1
+  m_DepthPrimingMode: 0
+  m_CopyDepthMode: 0
+  m_AccurateGbufferNormals: 1
+  m_IntermediateTextureMode: 1
+--- !u!114 &226138551534882000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e32e72b6a3f58a24c9033e2b9275eea0, type: 3}
+  m_Name: ScreenSpaceShadows
+  m_EditorClassIdentifier: 
+  m_Active: 1
+  m_Shader: {fileID: 4800000, guid: 0f854b35a0cf61a429bd5dcfea30eddd, type: 3}
