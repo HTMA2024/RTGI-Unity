@@ -4,30 +4,31 @@
 
 ## 效果展示
 
-![overview](images/overview.gif)
-![overview](images/overview1.gif)
+![overview](Images/overview.gif)
+![overview](Images/overview-1.gif)
+![overview](Images/overview-2.gif)
 
 ### 模式对比
 
 | SSGI (Screen Space) | RTGI (Ray Traced) | MixedDDGI | RTAO (Ray Traced) |
 |:---:|:---:|:---:|:---:|
-| ![ssgi](images/ssgi.jpg) | ![rtgi](images/rtgi.jpg) | ![mixed-ddgi](images/mixed-ddgi.jpg) | ![rtao](images/rtao.jpg) |
+| ![ssgi](Images/ssgi.jpg) | ![rtgi](Images/rtgi.jpg) | ![mixed-ddgi](Images/mixed-ddgi.jpg) | ![rtao](Images/rtao.jpg) |
 
 ### GI 开关对比
 
 | GI Off | GI On |
 |:---:|:---:|
-| ![gi-off](images/gi-off.jpg) | ![gi-on](images/gi-on.jpg) |
+| ![gi-off](Images/gi-off.jpg) | ![gi-on](Images/gi-on.jpg) |
 
 ### DDGI 探针可视化
 
-![probe-vis](images/probe-viz.gif)
+![probe-vis](Images/probe-viz.gif)
 
 ### Debug 可视化
 
 | IndirectDiffuse | HitDistance | SSGI Mask |
 |:---:|:---:|:---:|
-| ![debug-indirect](images/debug-indirect.jpg) | ![debug-hitdist](images/debug-hitdist.jpg) | ![debug-mask](images/debug-mask.jpg) |
+| ![debug-indirect](Images/debug-indirect.jpg) | ![debug-hitdist](Images/debug-hitdist.jpg) | ![debug-mask](Images/debug-mask.jpg) |
 
 ## 系统架构
 
