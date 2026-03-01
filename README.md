@@ -8,6 +8,10 @@
 ![overview](Images/overview-1.gif)
 ![overview](Images/overview-2.gif)
 
+
+![overview](Images/bistro.gif)
+![overview](Images/bistro-gi.jpg)
+
 ### 模式对比
 
 | SSGI (Screen Space) | RTGI (Ray Traced) | MixedDDGI | RTAO (Ray Traced) |
