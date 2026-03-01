@@ -34,7 +34,7 @@
 
 ### URPSSGI (`Assets/URPSSGI/`)
 
-将 HDRP SSGI/RTGI 的核心算法移植到 URP，支持四种 GI 模式：
+支持四种 GI 模式：
 
 - `ScreenSpace` — Hi-Z Ray Marching，纯屏幕空间追踪
 - `RayTraced` — DXR 硬件光线追踪
@@ -130,5 +130,8 @@ Assets/
 - 项目使用了较多 `multi_compile` 变体关键字，移植至其他项目时注意关键字冲突
 
 ## 许可
+本项目包含的 Sponza 场景资源受以下许可约束：
 
+Sponza 模型：CC BY 3.0 — © 2010 Frank Meinl, Crytek
+NoEmotion HDRs 纹理：CC BY-ND 4.0 — © 2022 Peter Sanitra
 Sponza 场景资源版权信息见 `Assets/com.unity.sponza-urp@5665fb87d0/copyright.txt`。
