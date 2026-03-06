@@ -1,59 +1,56 @@
+[中文版本 (Chinese Version)](README_CN.md)
+
 # URP Real-Time Global Illumination
 
-基于 Unity URP 14.0.12 的实时全局光照系统，在 Deferred Rendering + DXR 管线上实现了两套独立的 GI 方案。
+A real-time global illumination system built on Unity URP 14.0.12, implementing two independent GI solutions on top of Deferred Rendering + DXR pipeline.
 
-## 效果展示
+## Showcase
 
-![overview](Images/overview.gif)
-![overview](Images/overview-1.gif)
-![overview](Images/overview-2.gif)
+![overview-1](assets/github-repo-images/RTGI-Unity/overview-1.gif)
+![overview-2](assets/github-repo-images/RTGI-Unity/overview-2.gif)
 
-
-![overview](Images/bistro.gif)
-![overview](Images/bistro-gi.jpg)
-
-### 模式对比
+### Mode Comparison
 
 | SSGI (Screen Space) | RTGI (Ray Traced) | MixedDDGI | RTAO (Ray Traced) |
-|:---:|:---:|:---:|:---:|
-| ![ssgi](Images/ssgi.jpg) | ![rtgi](Images/rtgi.jpg) | ![mixed-ddgi](Images/mixed-ddgi.jpg) | ![rtao](Images/rtao.jpg) |
+|---|---|---|---|
+| ![ssgi](assets/github-repo-images/RTGI-Unity/ssgi.jpg) | ![rtgi](assets/github-repo-images/RTGI-Unity/rtgi.jpg) | ![mixed-ddgi](assets/github-repo-images/RTGI-Unity/mixed-ddgi.jpg) | ![rtao](assets/github-repo-images/RTGI-Unity/rtao.jpg) |
 
-### GI 开关对比
+### GI On/Off Comparison
 
 | GI Off | GI On |
-|:---:|:---:|
-| ![gi-off](Images/gi-off.jpg) | ![gi-on](Images/gi-on.jpg) |
+|---|---|
+| ![gi-off](assets/github-repo-images/RTGI-Unity/gi-off.jpg) | ![gi-on](assets/github-repo-images/RTGI-Unity/gi-on.jpg) |
 
-### DDGI 探针可视化
+### DDGI Probe Visualization
 
-![probe-vis](Images/probe-viz.gif)
+![probe-viz](assets/github-repo-images/RTGI-Unity/probe-viz.gif)
 
-### Debug 可视化
+### Debug Visualization
 
 | IndirectDiffuse | HitDistance | SSGI Mask |
-|:---:|:---:|:---:|
-| ![debug-indirect](Images/debug-indirect.jpg) | ![debug-hitdist](Images/debug-hitdist.jpg) | ![debug-mask](Images/debug-mask.jpg) |
+|---|---|---|
+| ![debug-indirect](assets/github-repo-images/RTGI-Unity/debug-indirect.jpg) | ![debug-hitdist](assets/github-repo-images/RTGI-Unity/debug-hitdist.jpg) | ![debug-mask](assets/github-repo-images/RTGI-Unity/debug-mask.jpg) |
 
-## 系统架构
+## System Architecture
 
-### URPSSGI (`Assets/URPSSGI/`)
+### URPSSGI (Assets/URPSSGI/)
 
-支持四种 GI 模式：
+Four GI modes supported:
 
-- `ScreenSpace` — Hi-Z Ray Marching，纯屏幕空间追踪
-- `RayTraced` — DXR 硬件光线追踪
-- `Mixed` — SSGI 优先，未命中像素回退至 RTGI，miss shader 采样天空盒
-- `MixedDDGI` — 与 Mixed 相同的混合策略，但 miss shader 改为采样 DDGI irradiance atlas
+- **ScreenSpace** — Hi-Z Ray Marching, pure screen-space tracing
+- **RayTraced** — DXR hardware ray tracing
+- **Mixed** — SSGI first, falls back to RTGI for missed pixels; miss shader samples skybox
+- **MixedDDGI** — Same hybrid strategy as Mixed, but miss shader samples DDGI irradiance atlas instead
 
-### DDGILightProbe (`Assets/DDGILightProbe/`)
+### DDGILightProbe (Assets/DDGILightProbe/)
 
-参考 NVIDIA RTXGI SDK 实现的动态漫反射探针系统。在三维均匀网格上布置探针，每帧通过 DXR 发射光线并更新 irradiance/distance atlas。支持 probe relocation、classification、variability-based adaptive update，并集成了完整的漏光抑制机制（surface bias、wrap shading、Chebyshev visibility test、weight crushing）。
+A dynamic diffuse probe system based on the NVIDIA RTXGI SDK. Probes are placed on a uniform 3D grid, with DXR rays dispatched each frame to update irradiance/distance atlases. Supports probe relocation, classification, variability-based adaptive update, and a full light leaking suppression pipeline (surface bias, wrap shading, Chebyshev visibility test, weight crushing).
 
-### 系统联动
+### System Integration
 
-两套系统可独立运行，也可通过 `MixedDDGI` 模式协同工作：共享同一 RTAS（每帧仅构建一次）、共享 Closest Hit Shader，DDGI 通过 `DDGIResourceProvider` 静态接口向 URPSSGI 暴露 atlas 资源。当 DDGI 未启用时，自动回退至标准 Mixed 模式。
+The two systems can run independently or work together via MixedDDGI mode: they share the same RTAS (built once per frame) and the same Closest Hit Shader. DDGI exposes atlas resources to URPSSGI through the `DDGIResourceProvider` static interface. When DDGI is disabled, the system automatically falls back to standard Mixed mode.
 
-## 渲染管线
+## Rendering Pipeline
 
 ```
 URPSSGI ScreenSpace:
@@ -70,26 +67,26 @@ DDGILightProbe (per frame):
   → Border Update → Ping-Pong Swap
 ```
 
-## 关键技术实现
+## Key Technical Details
 
 ### URPSSGI
 
-- Mip 层级打包至单张 `RWTexture2D`（Mip Atlas），规避 URP 下 mip chain 无法绑定为 UAV 的限制
-- 空间降噪采用世界空间圆盘采样 + 自适应核半径，结合深度/法线/平面距离三重双边权重
-- Mixed 模式下 SSGI 与 RTGI 统一经由 GBuffer → Deferred Lighting 路径着色，消除 ColorPyramid 与 Closest Hit Shader 之间的色调偏差
-- Temporal Filter 内联写入历史缓冲 + Merge-On-Read 策略，减少 5 次全屏 dispatch
-- 采样序列基于 Owen-scrambled Sobol + per-pixel ranking/scrambling（BND 序列）
-- 全程 Camera Relative Rendering
-- 内置 20 种 debug 可视化模式
+- Mip levels packed into a single `RWTexture2D` (Mip Atlas) to work around URP's inability to bind mip chains as UAVs
+- Spatial denoiser uses world-space disk sampling with adaptive kernel radius, combined with depth/normal/plane-distance trilateral bilateral weights
+- In Mixed mode, both SSGI and RTGI are shaded through the GBuffer → Deferred Lighting path, eliminating tonal bias between ColorPyramid and Closest Hit Shader
+- Temporal Filter inlines history buffer writes + Merge-On-Read strategy, saving 5 full-screen dispatches
+- Sampling sequences based on Owen-scrambled Sobol + per-pixel ranking/scrambling (BND sequences)
+- Full Camera Relative Rendering throughout
+- 20 built-in debug visualization modes
 
 ### DDGILightProbe
 
-- 直接光照、间接光照与 radiance 合成压缩至单个 compute pass（LightingCombined）
-- Atlas 采用 ping-pong 双缓冲实现零拷贝交换
-- Variability reduction 通过多级并行归约 + AsyncGPUReadback 驱动自适应更新频率
-- 探针可视化支持 irradiance / distance / relocation offset / classification state / backface ratio 等模式
+- Direct lighting, indirect lighting, and radiance compositing compressed into a single compute pass (LightingCombined)
+- Atlas uses ping-pong double buffering for zero-copy swaps
+- Variability reduction via multi-level parallel reduction + AsyncGPUReadback drives adaptive update frequency
+- Probe visualization supports irradiance / distance / relocation offset / classification state / backface ratio modes
 
-## 目录结构
+## Directory Structure
 
 ```
 Assets/
@@ -109,33 +106,34 @@ Assets/
 │   │                     DDGISampling.hlsl, DDGIRaytracing/ ...
 │   └── Editor/
 │
-├── SSRT3/                GTAO 半球切片采样参考实现（HDRP，只读）
-└── com.unity.sponza-urp@ Sponza 测试场景资源
+├── SSRT3/                GTAO hemisphere slice sampling reference (HDRP, read-only)
+└── com.unity.sponza-urp@ Sponza test scene assets
 ```
 
-## 环境要求与配置
+## Requirements & Setup
 
-- Unity 2022.3+，Windows 平台
-- 支持 DXR 1.0 的 GPU（不支持时自动回退至 ScreenSpace 模式）
+- Unity 2022.3+, Windows
+- GPU with DXR 1.0 support (falls back to ScreenSpace mode when unavailable)
 - URP Deferred Rendering Path
 
-### 配置步骤
+### Setup Steps
 
-1. 在 URP Renderer 上添加 `SSGIRendererFeature`，通过 Inspector 绑定所需的 Compute Shader 与纹理资源
-2. 在场景 Volume 中添加 `SSGIVolumeComponent`，选择 GI 模式并调整参数
-3. 如需启用 DDGI，额外添加 `DDGIApplyGIRendererFeature` 并在场景中放置 `DDGIVolume`
-4. 将 GI 模式切换至 `MixedDDGI` 即可启用两套系统的联动
+1. Add `SSGIRendererFeature` to the URP Renderer; bind required Compute Shaders and textures via Inspector
+2. Add `SSGIVolumeComponent` to a scene Volume; select GI mode and adjust parameters
+3. To enable DDGI, additionally add `DDGIApplyGIRendererFeature` and place a `DDGIVolume` in the scene
+4. Switch GI mode to `MixedDDGI` to enable both systems working together
 
-## 注意事项
+## Notes
 
-- 项目修改了本地 URP 14.0.12 包中的 `DeferredLights.cs`，升级 Unity 版本时需手动合并相关改动
-- 两套系统分别位于 `URPSSGI` 和 `DDGI` 命名空间下
-- `SSGIRendererFeature` 中的 shader/texture 引用通过 `SerializeField` 序列化，切换场景后可能需要重新绑定
-- 项目使用了较多 `multi_compile` 变体关键字，移植至其他项目时注意关键字冲突
+- This project modifies `DeferredLights.cs` in the local URP 14.0.12 package; manual merge is required when upgrading Unity
+- The two systems reside under the `URPSSGI` and `DDGI` namespaces respectively
+- Shader/texture references in `SSGIRendererFeature` are serialized via `SerializeField`; rebinding may be needed after switching scenes
+- The project uses many `multi_compile` variant keywords; watch for keyword conflicts when porting to other projects
 
-## 许可
-本项目包含的 Sponza 场景资源受以下许可约束：
+## License
 
-Sponza 模型：CC BY 3.0 — © 2010 Frank Meinl, Crytek
-NoEmotion HDRs 纹理：CC BY-ND 4.0 — © 2022 Peter Sanitra
-Sponza 场景资源版权信息见 `Assets/com.unity.sponza-urp@5665fb87d0/copyright.txt`。
+This project contains Sponza scene assets under the following licenses:
+- Sponza model: CC BY 3.0 — © 2010 Frank Meinl, Crytek
+- NoEmotion HDRs textures: CC BY-ND 4.0 — © 2022 Peter Sanitra
+
+See `Assets/com.unity.sponza-urp@5665fb87d0/copyright.txt` for full copyright information.
