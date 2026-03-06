@@ -6,30 +6,30 @@ A real-time global illumination system built on Unity URP 14.0.12, implementing 
 
 ## Showcase
 
-![overview-1](assets/github-repo-images/RTGI-Unity/overview-1.gif)
-![overview-2](assets/github-repo-images/RTGI-Unity/overview-2.gif)
+![overview-1](Images/overview-1.gif)
+![overview-2](Images/overview-2.gif)
 
 ### Mode Comparison
 
 | SSGI (Screen Space) | RTGI (Ray Traced) | MixedDDGI | RTAO (Ray Traced) |
 |---|---|---|---|
-| ![ssgi](assets/github-repo-images/RTGI-Unity/ssgi.jpg) | ![rtgi](assets/github-repo-images/RTGI-Unity/rtgi.jpg) | ![mixed-ddgi](assets/github-repo-images/RTGI-Unity/mixed-ddgi.jpg) | ![rtao](assets/github-repo-images/RTGI-Unity/rtao.jpg) |
+| ![ssgi](Images/ssgi.jpg) | ![rtgi](Images/rtgi.jpg) | ![mixed-ddgi](Images/mixed-ddgi.jpg) | ![rtao](Images/rtao.jpg) |
 
 ### GI On/Off Comparison
 
 | GI Off | GI On |
 |---|---|
-| ![gi-off](assets/github-repo-images/RTGI-Unity/gi-off.jpg) | ![gi-on](assets/github-repo-images/RTGI-Unity/gi-on.jpg) |
+| ![gi-off](Images/gi-off.jpg) | ![gi-on](Images/gi-on.jpg) |
 
 ### DDGI Probe Visualization
 
-![probe-viz](assets/github-repo-images/RTGI-Unity/probe-viz.gif)
+![probe-viz](Images/probe-viz.gif)
 
 ### Debug Visualization
 
 | IndirectDiffuse | HitDistance | SSGI Mask |
 |---|---|---|
-| ![debug-indirect](assets/github-repo-images/RTGI-Unity/debug-indirect.jpg) | ![debug-hitdist](assets/github-repo-images/RTGI-Unity/debug-hitdist.jpg) | ![debug-mask](assets/github-repo-images/RTGI-Unity/debug-mask.jpg) |
+| ![debug-indirect](Images/debug-indirect.jpg) | ![debug-hitdist](Images/debug-hitdist.jpg) | ![debug-mask](Images/debug-mask.jpg) |
 
 ## System Architecture
 
